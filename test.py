@@ -1,1 +1,1 @@
-hello('d')
+print("Hello, World!")
