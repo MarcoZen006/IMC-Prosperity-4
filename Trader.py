@@ -13,7 +13,7 @@ class Trader:
 
         print("traderData: " + state.traderData)
         print("Observations: " + str(state.observations))
-
+##TEST
         # Orders to be placed on exchange matching engine
         result = {}
         for product in state.order_depths:
