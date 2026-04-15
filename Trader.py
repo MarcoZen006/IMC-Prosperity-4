@@ -46,6 +46,16 @@ class Trader:
         return self.FAIR_VALUES[product]
 
     def run(self, state: TradingState):
+<<<<<<< HEAD
+=======
+        """Only method required. It takes all buy and sell orders for all
+        symbols as an input, and outputs a list of orders to be sent."""
+
+        print("traderData: " + state.traderData)
+        print("Observations: " + str(state.observations))
+##TEST
+        # Orders to be placed on exchange matching engine
+>>>>>>> 9dda59c3d62c1bacacd7880affb8a54335457123
         result = {}
 
         for product, order_depth in state.order_depths.items():
@@ -109,5 +119,9 @@ class Trader:
 
         traderData = ""
         conversions = 0
+<<<<<<< HEAD
 
         return result, conversions, traderData
+=======
+        return result, conversions, traderData
+>>>>>>> 9dda59c3d62c1bacacd7880affb8a54335457123
