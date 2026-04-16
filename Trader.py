@@ -134,11 +134,23 @@ class Trader:
         diffs = [hist[-i] - hist[-i - 1] for i in range(1, n)]
         return math.sqrt(sum(d * d for d in diffs) / len(diffs))
 
+
+    def ou_dynamic_std(self, hist: List[float]) -> float:
+        """Estimate the current stationary OU std from local per-tick vol.
+        We blend the calibrated stationary std with a rolling estimate so the
+        z-score stays meaningful across volatility regimes.
+        """
+        sigma_hat = self.local_vol(hist)  # per-tick RMS
+        std_hat = sigma_hat / math.sqrt(max(1e-6, 2.0 * self.OU_THETA))
+        # Blend and clamp to keep behaviour stable
+        blended = 0.75 * self.OU_STD + 0.25 * std_hat
+        return max(3.0, min(12.0, blended))
     # ──────────────────────── OU model ─────────────────────────
 
-    def ou_z_score(self, mid: float, mu: float) -> float:
-        return (mid - mu) / self.OU_STD
-
+    def ou_z_score(self, mid: float, mu: float, std: float) -> float:
+        # Guard against divide-by-zero and overly tiny std from short windows
+        std = max(1e-6, std)
+        return (mid - mu) / std
     def ou_update_mu(self, mid: float, mem: Dict) -> float:
         """
         Slowly adapt the long-run mean using a tiny EMA.
@@ -238,18 +250,7 @@ class Trader:
     def trade_osmium(
         self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
     ) -> List[Order]:
-        """
-        Mean-reversion market-making driven by the OU model.
-
-        Quote centre:
-            skewed_fair = μ
-                        − inv_skew   (lean against inventory)
-                        − z_skew     (lean in direction of OU signal)
-
-        Cross threshold:
-            Dynamically tightened when |z| is large so we lift cheap offers /
-            hit expensive bids more aggressively when the OU signal is strongest.
-        """
+        """Mean-reversion market-making with an OU signal and adaptive volatility."""
         product = "ASH_COATED_OSMIUM"
         limit = self.POSITION_LIMITS[product]
         orders: List[Order] = []
@@ -263,69 +264,79 @@ class Trader:
 
         # ── OU fair value & signal ──────────────────────────────────────────
         mu = self.ou_update_mu(mid, mem)
-        z = self.ou_z_score(mid, mu)      # signed OU deviation in units of σ_ou
+        dyn_std = self.ou_dynamic_std(mem["mid_hist"][product])
+        z = self.ou_z_score(mid, mu, dyn_std)
         abs_z = abs(z)
 
-        # Imbalance: small nudge toward heavier side (short-term pressure)
+        # Imbalance: short-term pressure (bounded)
         imbalance = self.order_book_imbalance(od, 3)
-        imb_nudge = 0.6 * imbalance       # ≤ 0.6 ticks
+        imb_nudge = 0.75 * max(-1.0, min(1.0, imbalance))  # ≤ 0.75 ticks
 
         # Quote centre with combined skew
-        inv = pos / limit                 # ∈ [−1, 1]
-        inv_skew = 3.5 * inv             # lean away from inventory
-        z_skew = 1.2 * max(-2.0, min(2.0, z))  # lean in direction of OU signal
+        inv = pos / limit  # ∈ [−1, 1]
+        # Stronger inventory protection when vol is low (tight spreads → faster fills)
+        inv_k = 3.0 + (2.0 if dyn_std < 6.0 else 0.0)
+        inv_skew = inv_k * inv
+        # Lean in the direction suggested by the OU signal (cap)
+        z_skew = 1.4 * max(-2.5, min(2.5, z))
         skewed_fair = mu - inv_skew - z_skew + imb_nudge
 
-        # ── End-of-day unwind ──────────────────────────────────────────────
-        if ts > 940_000:
+        # ── Earlier end-of-day unwind ──────────────────────────────────────
+        if ts > 930_000:
             if pos > 0 and bb is not None:
                 orders.append(Order(product, bb, -pos))
             elif pos < 0 and ba is not None:
                 orders.append(Order(product, ba, -pos))
             return orders
 
-        # ── Dynamic cross threshold (driven by OU z-score) ────────────────
-        # The larger |z|, the more mispriced the market is → be more aggressive
-        if abs_z >= 2.0:
+        # ── Dynamic cross threshold ────────────────────────────────────────
+        # More aggressive when |z| is large or when the spread is unusually wide.
+        spread = None
+        if bb is not None and ba is not None:
+            spread = max(0, ba - bb)
+
+        if abs_z >= 2.2:
             cross_thresh = 1
-        elif abs_z >= 1.5:
+        elif abs_z >= 1.4:
             cross_thresh = 2
-        elif abs_z >= 0.8:
+        elif abs_z >= 0.9:
             cross_thresh = 3
         else:
-            cross_thresh = 4   # near equilibrium: conservative, let MM do the work
+            cross_thresh = 4
 
-        # ── Aggressive crossing: take mispriced resting liquidity ──────────
-        # Buy when ask is cheap (below our skewed fair minus threshold)
-        orders.extend(
-            self.take_asks(product, od, skewed_fair - cross_thresh, pos, limit)
-        )
+        if spread is not None and spread >= 6:
+            cross_thresh = max(1, cross_thresh - 1)
+
+        # ── Aggressive crossing ────────────────────────────────────────────
+        orders.extend(self.take_asks(product, od, skewed_fair - cross_thresh, pos, limit))
         pos_a = pos + sum(o.quantity for o in orders)
 
-        # Sell when bid is expensive (above our skewed fair plus threshold)
-        orders.extend(
-            self.take_bids(product, od, skewed_fair + cross_thresh, pos_a, limit)
-        )
+        orders.extend(self.take_bids(product, od, skewed_fair + cross_thresh, pos_a, limit))
         pos_a = pos + sum(o.quantity for o in orders)
 
         # ── Passive quoting ────────────────────────────────────────────────
-        # Dynamic half-spread: wider when local vol is elevated
-        lv = self.local_vol(mem["mid_hist"][product])
-        half_spread = max(2, min(5, round(lv * 0.75)))
+        half_spread = max(1, min(5, int(round(dyn_std * 0.35))))
 
-        # Size: larger when OU signal & inventory both support the direction,
-        #       smaller when near the limit or when z is near 0.
         inv_a = pos_a / limit
-        base_size = max(5, 16 - int(8 * abs(inv_a)))
+        base_size = max(6, 18 - int(10 * abs(inv_a)))
 
-        # Boost size when OU strongly supports the trade direction
-        if (z < -1.0 and pos_a < limit * 0.6) or (z > 1.0 and pos_a > -limit * 0.6):
-            base_size = min(base_size + 4, 22)
+        sig_boost = 0
+        if abs_z >= 1.0:
+            sig_boost = 2
+        if abs_z >= 1.8:
+            sig_boost = 4
+        if (z < 0 and inv_a > 0.55) or (z > 0 and inv_a < -0.55):
+            sig_boost = 0
+        base_size = min(24, base_size + sig_boost)
 
         bid_px = math.floor(skewed_fair - half_spread)
         ask_px = math.ceil(skewed_fair + half_spread)
 
-        # Don't place orders behind the inside market (queue waste)
+        if z <= -1.2:
+            bid_px += 1
+        elif z >= 1.2:
+            ask_px -= 1
+
         if bb is not None:
             bid_px = min(bid_px, bb + 1)
         if ba is not None:
@@ -342,9 +353,6 @@ class Trader:
             orders.append(Order(product, ask_px, -min(base_size, sell_cap)))
 
         return orders
-
-    # ──────────────────────── Pepper logic ─────────────────────
-
     def target_pos_pepper(self, ts: int) -> int:
         """
         Step-down target position for Pepper.
@@ -362,16 +370,14 @@ class Trader:
     def trade_pepper(
         self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
     ) -> List[Order]:
-        """
-        Trend-riding with Kalman-filtered fair value.
+        """Trend-riding with Kalman-filtered fair value + risk controls.
 
-        Strategy
-        ────────
-        • Maintain max long position (50) throughout the uptrend.
-        • Fair value from Kalman filter tracking the linear intercept.
-        • Aggressive buying early (large threshold above fair) to build the book.
-        • Step-down target near end-of-day for clean unwind.
-        • Passive ask placed well above fair so we don't accidentally sell early.
+        Uptrend edge is strong, but the main profit leak is (a) overpaying when
+        temporarily stretched above fair and (b) holding max long through
+        pullbacks late in the day. This version:
+          • Gates aggressive buying when price is far above fair.
+          • Takes profits opportunistically when stretched above fair.
+          • Adds a simple late-day drawdown de-risk.
         """
         product = "INTARIAN_PEPPER_ROOT"
         limit = self.POSITION_LIMITS[product]
@@ -387,82 +393,100 @@ class Trader:
         # ── Kalman-filtered fair value ─────────────────────────────────────
         fair = self.kf_update(ts, mid, mem)
 
-        # Small imbalance nudge (keep it tiny – trend already supplies the edge)
+        # Tiny imbalance nudge (trend already supplies the edge)
         imbalance = self.order_book_imbalance(od, 3)
-        fair += 0.25 * max(0.0, imbalance)   # only positive imbalance adds to buy fair
+        fair += 0.25 * max(0.0, imbalance)
 
+        resid = mid - fair  # + = expensive vs fair, − = cheap vs fair
+
+        # Base target schedule
         target = self.target_pos_pepper(ts)
+
+        # Late-day de-risk if price is meaningfully below fair (trend wobble)
+        if ts > 820_000 and resid < -6.0:
+            target = min(target, 20)
+        if ts > 900_000 and resid < -8.0:
+            target = min(target, 10)
+
         pos_a = pos
 
         # ── Phase 1: Build long position up to target ──────────────────────
         need = max(0, target - pos_a)
         if need > 0:
-            # Accept increasing price premiums early in the day because the
-            # trend advantage far exceeds the crossing cost.
-            if ts < 10_000:
-                max_buy = fair + 12
-            elif ts < 50_000:
-                max_buy = fair + 6
-            elif ts < 200_000:
-                max_buy = fair + 3
-            elif ts < 800_000:
-                max_buy = fair + 2
-            else:
+            # Don't chase when stretched too high above fair.
+            if resid > 6.0:
                 max_buy = fair + 1
+            else:
+                if ts < 10_000:
+                    max_buy = fair + 10
+                elif ts < 50_000:
+                    max_buy = fair + 6
+                elif ts < 200_000:
+                    max_buy = fair + 3
+                elif ts < 800_000:
+                    max_buy = fair + 2
+                else:
+                    max_buy = fair + 1
 
             new = self.take_asks(product, od, max_buy, pos_a, limit, cap=need)
             orders.extend(new)
             pos_a += sum(o.quantity for o in new)
 
-        # ── Phase 2: Trim excess above target ─────────────────────────────
+        # ── Phase 2: Profit-taking / trim when stretched high ──────────────
+        # If we're long and price is rich vs fair, sell into strength.
+        if pos_a > 0 and resid > 7.0:
+            extra = min(pos_a, max(5, int((resid - 6.0) * 2)))
+            min_sell = fair + 4
+            new = self.take_bids(product, od, min_sell, pos_a, limit, cap=extra)
+            orders.extend(new)
+            pos_a += sum(o.quantity for o in new)
+
+        # ── Phase 3: Trim excess above target ─────────────────────────────
         extra = max(0, pos_a - target)
         if extra > 0:
-            # Never sell cheap mid-day; near end-of-day allow wider margin
+            # Mid-day: only sell far above fair; near EoD allow closer-to-fair exits
             min_sell = fair - 1 if ts > 900_000 else fair + 8
             new = self.take_bids(product, od, min_sell, pos_a, limit, cap=extra)
             orders.extend(new)
             pos_a += sum(o.quantity for o in new)
 
-        # ── Phase 3: Hard unwind at day end ───────────────────────────────
-        if ts > 975_000:
+        # ── Phase 4: Hard unwind at day end ───────────────────────────────
+        if ts > 970_000:
             if pos_a > 0 and bb is not None:
                 orders.append(Order(product, bb, -pos_a))
             elif pos_a < 0 and ba is not None:
                 orders.append(Order(product, ba, -pos_a))
             return orders
 
-        # ── Phase 4: Passive quoting ───────────────────────────────────────
+        # ── Phase 5: Passive quoting ───────────────────────────────────────
         buy_cap = max(0, limit - pos_a)
         sell_cap = max(0, limit + pos_a)
 
-        # Bid: just above Kalman fair to stay at top of queue
-        bid_px = math.floor(fair + 0.5)
+        # Bid: slightly above fair to keep queue priority, but not if expensive.
+        bid_px = math.floor(fair + (0.5 if resid <= 6.0 else 0.0))
         if bb is not None:
             bid_px = min(bid_px, bb + 1)
 
-        # Ask: well above fair unless we're reducing or near EoD
-        if pos_a > target or ts > 880_000:
-            ask_px = math.ceil(fair + 2)
+        # Ask: if we're above target or stretched, quote closer so we can lighten.
+        if pos_a > target or resid > 6.0 or ts > 880_000:
+            ask_px = math.ceil(fair + 3)
         else:
-            ask_px = math.ceil(fair + 22)   # won't fill → effectively hold position
+            ask_px = math.ceil(fair + 22)  # effectively "don't sell" during clean trend
         if ba is not None:
             ask_px = max(ask_px, ba - 1)
         if bid_px >= ask_px:
             bid_px = ask_px - 1
 
-        if pos_a < target and buy_cap > 0:
+        if pos_a < target and buy_cap > 0 and resid <= 7.0:
             size = min(buy_cap, max(10, target - pos_a))
             orders.append(Order(product, bid_px, size))
 
-        if (pos_a > target or ts > 900_000) and sell_cap > 0:
+        if (pos_a > target or resid > 6.0 or ts > 900_000) and sell_cap > 0:
             size = min(sell_cap, max(5, pos_a - target))
             if size > 0:
                 orders.append(Order(product, ask_px, -size))
 
         return orders
-
-    # ──────────────────────── Run ───────────────────────────────
-
     def run(self, state: TradingState):
         mem = self.load_state(state.traderData)
         result: Dict[str, List[Order]] = {}
