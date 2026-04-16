@@ -409,121 +409,65 @@ class Trader:
     def trade_pepper(
         self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
     ) -> List[Order]:
-        """Trend-riding with Kalman-filtered fair value + risk controls.
+        """PEPPER drift-capture (error-safe).
 
-        Uptrend edge is strong, but the main profit leak is (a) overpaying when
-        temporarily stretched above fair and (b) holding max long through
-        pullbacks late in the day. This version:
-          • Gates aggressive buying when price is far above fair.
-          • Takes profits opportunistically when stretched above fair.
-          • Adds a simple late-day drawdown de-risk.
+        Policy:
+          • get to +limit quickly early (small sweep of asks),
+          • hold +limit most of the session (no profit-taking),
+          • unwind in stages late,
+          • hard flatten very late.
         """
         product = "INTARIAN_PEPPER_ROOT"
         limit = self.POSITION_LIMITS[product]
         orders: List[Order] = []
 
         bb, ba = self.best_bid_ask(od)
-        mid = self.micro_price(od)
-        if mid is None:
+        if bb is None and ba is None:
             return orders
 
         ts = state.timestamp
 
-        # ── Kalman-filtered fair value ─────────────────────────────────────
-        fair = self.kf_update(ts, mid, mem)
-
-        # Tiny imbalance nudge (trend already supplies the edge)
-        imbalance = self.order_book_imbalance(od, 3)
-        fair += 0.25 * max(0.0, imbalance)
-
-        resid = mid - fair  # + = expensive vs fair, − = cheap vs fair
-
-        # Base target schedule
-        target = self.target_pos_pepper(ts)
-
-        # Late-day de-risk if price is meaningfully below fair (trend wobble)
-        if ts > 820_000 and resid < -6.0:
-            target = min(target, 20)
-        if ts > 900_000 and resid < -8.0:
-            target = min(target, 10)
-
-        pos_a = pos
-
-        # ── Phase 1: Build long position up to target ──────────────────────
-        need = max(0, target - pos_a)
-        if need > 0:
-            # Don't chase when stretched too high above fair.
-            if resid > 6.0:
-                max_buy = fair + 1
-            else:
-                if ts < 10_000:
-                    max_buy = fair + 10
-                elif ts < 50_000:
-                    max_buy = fair + 6
-                elif ts < 200_000:
-                    max_buy = fair + 3
-                elif ts < 800_000:
-                    max_buy = fair + 2
-                else:
-                    max_buy = fair + 1
-
-            new = self.take_asks(product, od, max_buy, pos_a, limit, cap=need)
-            orders.extend(new)
-            pos_a += sum(o.quantity for o in new)
-
-        # ── Phase 2: Profit-taking / trim when stretched high ──────────────
-        # If we're long and price is rich vs fair, sell into strength.
-        if pos_a > 0 and resid > 7.0:
-            extra = min(pos_a, max(5, int((resid - 6.0) * 2)))
-            min_sell = fair + 4
-            new = self.take_bids(product, od, min_sell, pos_a, limit, cap=extra)
-            orders.extend(new)
-            pos_a += sum(o.quantity for o in new)
-
-        # ── Phase 3: Trim excess above target ─────────────────────────────
-        extra = max(0, pos_a - target)
-        if extra > 0:
-            # Mid-day: only sell far above fair; near EoD allow closer-to-fair exits
-            min_sell = fair - 1 if ts > 900_000 else fair + 8
-            new = self.take_bids(product, od, min_sell, pos_a, limit, cap=extra)
-            orders.extend(new)
-            pos_a += sum(o.quantity for o in new)
-
-        # ── Phase 4: Hard unwind at day end ───────────────────────────────
-        if ts > 970_000:
-            if pos_a > 0 and bb is not None:
-                orders.append(Order(product, bb, -pos_a))
-            elif pos_a < 0 and ba is not None:
-                orders.append(Order(product, ba, -pos_a))
-            return orders
-
-        # ── Phase 5: Passive quoting ───────────────────────────────────────
-        buy_cap = max(0, limit - pos_a)
-        sell_cap = max(0, limit + pos_a)
-
-        # Bid: slightly above fair to keep queue priority, but not if expensive.
-        bid_px = math.floor(fair + (0.5 if resid <= 6.0 else 0.0))
-        if bb is not None:
-            bid_px = min(bid_px, bb + 1)
-
-        # Ask: if we're above target or stretched, quote closer so we can lighten.
-        if pos_a > target or resid > 6.0 or ts > 880_000:
-            ask_px = math.ceil(fair + 3)
+        # Stage targets (late unwind). Uses full long most of the day.
+        if ts < 910_000:
+            target = limit
+        elif ts < 960_000:
+            target = 35
+        elif ts < 985_000:
+            target = 15
         else:
-            ask_px = math.ceil(fair + 22)  # effectively "don't sell" during clean trend
-        if ba is not None:
-            ask_px = max(ask_px, ba - 1)
-        if bid_px >= ask_px:
-            bid_px = ask_px - 1
+            target = 0
 
-        if pos_a < target and buy_cap > 0 and resid <= 7.0:
-            size = min(buy_cap, max(10, target - pos_a))
-            orders.append(Order(product, bid_px, size))
+        # ---- Build to target (early aggressive) ----
+        if pos < target and ba is not None:
+            need = min(target - pos, limit - pos)
+            # Early: allow sweeping slightly above best ask to guarantee fills.
+            # Later: only take best ask.
+            cushion = 2 if ts < 25_000 else (1 if ts < 60_000 else 0)
+            max_buy_px = ba + cushion
 
-        if (pos_a > target or resid > 6.0 or ts > 900_000) and sell_cap > 0:
-            size = min(sell_cap, max(5, pos_a - target))
-            if size > 0:
-                orders.append(Order(product, ask_px, -size))
+            # Use existing helper (sweeps asks up to max price)
+            new = self.take_asks(product, od, max_buy_px, pos, limit, cap=need)
+            orders.extend(new)
+            pos += sum(o.quantity for o in new)
+
+        # ---- Reduce to target (late staged unwind) ----
+        if pos > target and bb is not None:
+            need = min(pos - target, pos + limit)
+            # Closer to close, accept slightly worse to ensure we get out.
+            cushion = 2 if ts > 970_000 else (1 if ts > 930_000 else 0)
+            min_sell_px = bb - cushion
+
+            new = self.take_bids(product, od, min_sell_px, pos, limit, cap=need)
+            orders.extend(new)
+            pos += sum(o.quantity for o in new)
+
+        # ---- Hard flatten at the very end ----
+        if ts > 995_000:
+            bb2, ba2 = self.best_bid_ask(od)
+            if pos > 0 and bb2 is not None:
+                orders.append(Order(product, bb2, -pos))
+            elif pos < 0 and ba2 is not None:
+                orders.append(Order(product, ba2, -pos))
 
         return orders
     def run(self, state: TradingState):
