@@ -247,10 +247,19 @@ class Trader:
 
     # ──────────────────────── Osmium logic ─────────────────────
 
+
     def trade_osmium(
         self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
     ) -> List[Order]:
-        """Mean-reversion market-making with an OU signal and adaptive volatility."""
+        """
+        OSMIUM: Mean-reversion market-making with OU signal + microstructure safety.
+
+        Goal: keep the strong baseline behaviour of Paveet_trader_F, but avoid the
+        PnL drop from overly-tight quotes by:
+          • detecting short-horizon "toxic" conditions (imbalance + momentum),
+          • widening / shrinking size under toxicity,
+          • adding a small inside-quote tier ONLY when conditions are benign.
+        """
         product = "ASH_COATED_OSMIUM"
         limit = self.POSITION_LIMITS[product]
         orders: List[Order] = []
@@ -268,20 +277,27 @@ class Trader:
         z = self.ou_z_score(mid, mu, dyn_std)
         abs_z = abs(z)
 
-        # Imbalance: short-term pressure (bounded)
-        imbalance = self.order_book_imbalance(od, 3)
-        imb_nudge = 0.75 * max(-1.0, min(1.0, imbalance))  # ≤ 0.75 ticks
+        # Microstructure features
+        imbalance = self.order_book_imbalance(od, 3)  # [-1,1]
+        imb = max(-1.0, min(1.0, imbalance))
+
+        # Short-horizon momentum (very cheap)
+        mh = mem["mid_hist"][product]
+        mom = 0.0
+        if len(mh) >= 6:
+            mom = mh[-1] - mh[-6]  # ~5-step momentum
+        # toxicity proxy: strong one-sided book + price moving same way
+        toxic = (abs(imb) > 0.55) and (mom * imb > 0.0)
 
         # Quote centre with combined skew
-        inv = pos / limit  # ∈ [−1, 1]
-        # Stronger inventory protection when vol is low (tight spreads → faster fills)
+        inv = pos / limit  # [-1,1]
         inv_k = 3.0 + (2.0 if dyn_std < 6.0 else 0.0)
         inv_skew = inv_k * inv
-        # Lean in the direction suggested by the OU signal (cap)
         z_skew = 1.4 * max(-2.5, min(2.5, z))
-        skewed_fair = mu - inv_skew - z_skew + imb_nudge
+        imb_nudge = 0.75 * imb  # <= 0.75 ticks
+        fair = mu - inv_skew - z_skew + imb_nudge
 
-        # ── Earlier end-of-day unwind ──────────────────────────────────────
+        # ── End-of-day unwind (keep baseline timing; do not "panic" early) ──
         if ts > 930_000:
             if pos > 0 and bb is not None:
                 orders.append(Order(product, bb, -pos))
@@ -289,8 +305,7 @@ class Trader:
                 orders.append(Order(product, ba, -pos))
             return orders
 
-        # ── Dynamic cross threshold ────────────────────────────────────────
-        # More aggressive when |z| is large or when the spread is unusually wide.
+        # ── Crossing policy ────────────────────────────────────────────────
         spread = None
         if bb is not None and ba is not None:
             spread = max(0, ba - bb)
@@ -304,39 +319,54 @@ class Trader:
         else:
             cross_thresh = 4
 
-        if spread is not None and spread >= 6:
+        # Under toxicity: be less eager to cross (avoid getting picked off)
+        if toxic and abs_z < 2.6:
+            cross_thresh = max(4, cross_thresh)
+
+        if spread is not None and spread >= 6 and not toxic:
             cross_thresh = max(1, cross_thresh - 1)
 
-        # ── Aggressive crossing ────────────────────────────────────────────
-        orders.extend(self.take_asks(product, od, skewed_fair - cross_thresh, pos, limit))
+        # Aggressive crossing
+        orders.extend(self.take_asks(product, od, fair - cross_thresh, pos, limit))
         pos_a = pos + sum(o.quantity for o in orders)
 
-        orders.extend(self.take_bids(product, od, skewed_fair + cross_thresh, pos_a, limit))
+        orders.extend(self.take_bids(product, od, fair + cross_thresh, pos_a, limit))
         pos_a = pos + sum(o.quantity for o in orders)
 
         # ── Passive quoting ────────────────────────────────────────────────
+        # Baseline width, widened slightly when toxic.
         half_spread = max(1, min(5, int(round(dyn_std * 0.35))))
+        if toxic:
+            half_spread = min(6, half_spread + 1)
 
         inv_a = pos_a / limit
         base_size = max(6, 18 - int(10 * abs(inv_a)))
 
+        # Size boosts when signal strong, but not when toxicity suggests adverse selection.
         sig_boost = 0
         if abs_z >= 1.0:
             sig_boost = 2
         if abs_z >= 1.8:
             sig_boost = 4
+        if toxic:
+            sig_boost = 0
+            base_size = max(4, int(base_size * 0.7))
+
+        # Don't add risk if signal fights inventory
         if (z < 0 and inv_a > 0.55) or (z > 0 and inv_a < -0.55):
             sig_boost = 0
         base_size = min(24, base_size + sig_boost)
 
-        bid_px = math.floor(skewed_fair - half_spread)
-        ask_px = math.ceil(skewed_fair + half_spread)
+        bid_px = math.floor(fair - half_spread)
+        ask_px = math.ceil(fair + half_spread)
 
-        if z <= -1.2:
+        # small price shading when conviction is high (keep baseline)
+        if z <= -1.2 and not toxic:
             bid_px += 1
-        elif z >= 1.2:
+        elif z >= 1.2 and not toxic:
             ask_px -= 1
 
+        # Clamp to near top-of-book
         if bb is not None:
             bid_px = min(bid_px, bb + 1)
         if ba is not None:
@@ -347,6 +377,15 @@ class Trader:
         buy_cap = max(0, limit - pos_a)
         sell_cap = max(0, limit + pos_a)
 
+        # Tier-1: small inside quote when benign and spread allows.
+        if (not toxic) and spread is not None and spread >= 2:
+            inside_sz = 6
+            if buy_cap > 0 and bb is not None:
+                orders.append(Order(product, bb + 1, min(inside_sz, buy_cap)))
+            if sell_cap > 0 and ba is not None:
+                orders.append(Order(product, ba - 1, -min(inside_sz, sell_cap)))
+
+        # Tier-2: main quotes around fair
         if buy_cap > 0:
             orders.append(Order(product, bid_px, min(base_size, buy_cap)))
         if sell_cap > 0:
