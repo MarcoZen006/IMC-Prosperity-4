@@ -1,3 +1,32 @@
+"""
+Marco_trader_4.0.py  –  IMC Prosperity Round 1
+================================================
+Key improvements over v3.5
+──────────────────────────
+ASH_COATED_OSMIUM
+  • Ornstein-Uhlenbeck (OU) process replaces ad-hoc autocorrelation blend.
+    Calibrated from 3-day historical data: θ=0.2427, μ=10000.20, σ_ou=5.014.
+  • z-score = (mid − μ) / σ_ou drives BOTH the cross threshold (how
+    aggressively we take mispriced liquidity) AND the quote-centre skew.
+  • Combined quote skew = inventory skew + OU signal skew (both lean in the
+    profitable direction; opposing signals partially cancel).
+  • Dynamic half-spread tied to realised local volatility.
+  • End-of-day unwind starts a little earlier and flattens harder.
+
+INTARIAN_PEPPER_ROOT
+  • Kalman filter (1-D random-walk state) replaces the simple EMA intercept.
+    Tracks the detrended price = mid − slope×t optimally, with Q=0.10,
+    R=5.0 (calibrated: noise_std≈2.2, so R≈2.2²≈5).  Steady-state
+    Kalman gain ≈ 0.12 – tighter than the old α=0.15 warm-up but more
+    responsive than α=0.01 late phase.
+  • Imbalance nudge kept but tightened.
+
+Both products
+  • Volume-weighted mid (micro-price) for sharper fair-value estimates.
+  • Simplified state: removed regime strings; OU/KF provide quantitative
+    signals instead.
+"""
+
 from datamodel import OrderDepth, TradingState, Order
 from typing import Dict, List, Tuple, Optional
 import json
@@ -5,31 +34,35 @@ import math
 
 
 class Trader:
+    # ──────────────────────── Constants ────────────────────────
     POSITION_LIMITS = {
         "ASH_COATED_OSMIUM": 50,
         "INTARIAN_PEPPER_ROOT": 50,
     }
 
-    OSMIUM_LONG_MEAN = 10000.0
-    PEPPER_SLOPE = 0.001000
+    # OU parameters – calibrated via OLS on all 3 historical days
+    OU_MU: float = 10000.20   # long-run mean
+    OU_THETA: float = 0.2427  # mean-reversion speed (per tick)
+    OU_SIGMA: float = 3.494   # per-tick noise std
+    OU_STD: float = 5.014     # stationary std = σ / √(2θ)
+    OU_MU_ALPHA: float = 5e-4 # very slow μ adaptation (handles regime drift)
+
+    # Pepper linear trend (exactly matches data across all days)
+    PEPPER_SLOPE: float = 0.001000  # seashells per timestamp tick
+
+    # Kalman filter hyperparameters for Pepper intercept tracking
+    KF_Q: float = 0.10   # process noise variance (intercept random-walk step)
+    KF_R: float = 5.00   # observation noise variance  (~2.2² from calibration)
+    KF_P0: float = 500.0 # large initial uncertainty → fast early convergence
+
+    # ──────────────────────── State ────────────────────────────
 
     def default_state(self) -> Dict:
         return {
-            "last_mid": {},
-            "pepper_intercept": None,
-            "osmium_adj_fair": self.OSMIUM_LONG_MEAN,
-            "mid_hist": {
-                "ASH_COATED_OSMIUM": [],
-                "INTARIAN_PEPPER_ROOT": [],
-            },
-            "spread_hist": {
-                "ASH_COATED_OSMIUM": [],
-                "INTARIAN_PEPPER_ROOT": [],
-            },
-            "imb_hist": {
-                "ASH_COATED_OSMIUM": [],
-                "INTARIAN_PEPPER_ROOT": [],
-            },
+            "ou_mu": self.OU_MU,
+            "kf_x": None,        # Kalman intercept estimate
+            "kf_P": self.KF_P0,  # Kalman error variance
+            "mid_hist": {p: [] for p in self.POSITION_LIMITS},
         }
 
     def load_state(self, trader_data: str) -> Dict:
@@ -41,16 +74,9 @@ class Trader:
             for k, v in base.items():
                 if k not in s:
                     s[k] = v
-            for bucket in ["mid_hist", "spread_hist", "imb_hist", "last_mid"]:
-                if bucket not in s or not isinstance(s[bucket], dict):
-                    s[bucket] = base[bucket]
             for p in self.POSITION_LIMITS:
                 if p not in s["mid_hist"]:
                     s["mid_hist"][p] = []
-                if p not in s["spread_hist"]:
-                    s["spread_hist"][p] = []
-                if p not in s["imb_hist"]:
-                    s["imb_hist"][p] = []
             return s
         except Exception:
             return base
@@ -58,93 +84,121 @@ class Trader:
     def dump_state(self, s: Dict) -> str:
         return json.dumps(s, separators=(",", ":"))
 
+    # ──────────────────────── Market helpers ───────────────────
+
     def best_bid_ask(self, od: OrderDepth) -> Tuple[Optional[int], Optional[int]]:
         bb = max(od.buy_orders) if od.buy_orders else None
         ba = min(od.sell_orders) if od.sell_orders else None
         return bb, ba
 
-    def mid(self, od: OrderDepth) -> Optional[float]:
-        bb, ba = self.best_bid_ask(od)
-        if bb is not None and ba is not None:
+    def micro_price(self, od: OrderDepth) -> Optional[float]:
+        """
+        Volume-weighted mid (micro-price).
+        Uses best bid/ask weighted by the opposing side's volume so that a
+        thick ask pulls the fair price toward the ask, and vice-versa.
+        Falls back to simple mid when one side is missing.
+        """
+        bb = max(od.buy_orders) if od.buy_orders else None
+        ba = min(od.sell_orders) if od.sell_orders else None
+        if bb is None and ba is None:
+            return None
+        if bb is None:
+            return float(ba)
+        if ba is None:
+            return float(bb)
+        bid_vol = od.buy_orders[bb]        # positive
+        ask_vol = -od.sell_orders[ba]      # positive (stored negative)
+        total = bid_vol + ask_vol
+        if total <= 0:
             return 0.5 * (bb + ba)
-        return float(bb) if bb is not None else (float(ba) if ba is not None else None)
-
-    def top_levels(self, od: OrderDepth, levels: int = 3) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
-        bids = sorted(od.buy_orders.items(), reverse=True)[:levels]
-        asks = sorted(od.sell_orders.items())[:levels]
-        return bids, asks
+        return (bb * ask_vol + ba * bid_vol) / total  # microprice
 
     def order_book_imbalance(self, od: OrderDepth, levels: int = 3) -> float:
-        bids, asks = self.top_levels(od, levels)
+        bids = sorted(od.buy_orders.items(), reverse=True)[:levels]
+        asks = sorted(od.sell_orders.items())[:levels]
         bid_vol = sum(max(0, qty) for _, qty in bids)
         ask_vol = sum(max(0, -qty) for _, qty in asks)
         total = bid_vol + ask_vol
-        if total <= 0:
-            return 0.0
-        return (bid_vol - ask_vol) / total
+        return (bid_vol - ask_vol) / total if total > 0 else 0.0
 
-    def push_hist(self, hist: List[float], value: float, maxlen: int = 25) -> None:
-        hist.append(value)
+    def push_hist(self, hist: List[float], val: float, maxlen: int = 30) -> None:
+        hist.append(val)
         if len(hist) > maxlen:
             del hist[0]
 
-    def mean(self, arr: List[float]) -> float:
-        return sum(arr) / len(arr) if arr else 0.0
-
-    def stdev(self, arr: List[float]) -> float:
-        n = len(arr)
+    def local_vol(self, hist: List[float], window: int = 12) -> float:
+        """RMS of recent mid differences as a proxy for instantaneous vol."""
+        n = min(len(hist), window)
         if n < 2:
-            return 0.0
-        mu = self.mean(arr)
-        return math.sqrt(sum((x - mu) * (x - mu) for x in arr) / (n - 1))
+            return self.OU_SIGMA
+        diffs = [hist[-i] - hist[-i - 1] for i in range(1, n)]
+        return math.sqrt(sum(d * d for d in diffs) / len(diffs))
 
-    def slope_per_tick(self, mids: List[float]) -> float:
-        n = len(mids)
-        if n < 2:
-            return 0.0
-        x_mean = 0.5 * (n - 1)
-        y_mean = self.mean(mids)
-        num = 0.0
-        den = 0.0
-        for i, y in enumerate(mids):
-            dx = i - x_mean
-            num += dx * (y - y_mean)
-            den += dx * dx
-        if den == 0:
-            return 0.0
-        return num / den
+    # ──────────────────────── OU model ─────────────────────────
 
-    def regime(self, product: str, mem: Dict) -> str:
-        mids = mem["mid_hist"][product]
-        spreads = mem["spread_hist"][product]
-        imbs = mem["imb_hist"][product]
+    def ou_z_score(self, mid: float, mu: float) -> float:
+        return (mid - mu) / self.OU_STD
 
-        if len(mids) < 8:
-            return "normal"
+    def ou_update_mu(self, mid: float, mem: Dict) -> float:
+        """
+        Slowly adapt the long-run mean using a tiny EMA.
+        Keeps μ anchored to calibrated value but can track very slow drifts.
+        """
+        mem["ou_mu"] = (1 - self.OU_MU_ALPHA) * mem["ou_mu"] + self.OU_MU_ALPHA * mid
+        return mem["ou_mu"]
 
-        diffs = [mids[i] - mids[i - 1] for i in range(1, len(mids))]
-        vol = self.stdev(diffs[-12:]) if len(diffs) >= 2 else 0.0
-        slope = self.slope_per_tick(mids[-12:])
-        avg_spread = self.mean(spreads[-8:]) if spreads else 0.0
-        imb_strength = abs(self.mean(imbs[-5:])) if imbs else 0.0
+    # ──────────────────────── Kalman filter ────────────────────
 
-        if product == "INTARIAN_PEPPER_ROOT":
-            if slope > 0.45:
-                return "strong_uptrend"
-            if slope > 0.15:
-                return "uptrend"
-            if vol > 4.5 or avg_spread > 15:
-                return "volatile"
-            return "normal"
+    def kf_update(self, ts: int, mid: float, mem: Dict) -> float:
+        """
+        1-D Kalman filter for the Pepper trend intercept.
 
-        if vol > 5.5 or avg_spread > 18:
-            return "volatile"
-        if imb_strength > 0.30:
-            return "pressure"
-        return "mean_revert"
+        Model
+        ─────
+          State  x_k  = intercept  (random walk with noise Q)
+          Obs    z_k  = mid − slope × t  ≈  intercept + v,  v ~ N(0, R)
 
-    def take_asks(self, product, od, max_px, pos, limit, cap=None) -> List[Order]:
-        orders, room = [], limit - pos
+        Returns the Kalman-filtered fair price at the current timestamp.
+        """
+        obs = mid - self.PEPPER_SLOPE * ts   # detrend → should be ≈ intercept
+
+        x = mem["kf_x"]
+        P = mem["kf_P"]
+
+        if x is None:
+            # Bootstrap: trust first observation with observation-noise variance
+            mem["kf_x"] = obs
+            mem["kf_P"] = self.KF_R
+            return mid
+
+        # Predict (intercept drifts as a random walk)
+        x_pred = x
+        P_pred = P + self.KF_Q
+
+        # Update (incorporate new price observation)
+        K = P_pred / (P_pred + self.KF_R)       # Kalman gain
+        x_new = x_pred + K * (obs - x_pred)     # posterior mean
+        P_new = (1.0 - K) * P_pred              # posterior variance
+
+        mem["kf_x"] = x_new
+        mem["kf_P"] = P_new
+
+        return x_new + self.PEPPER_SLOPE * ts    # re-add trend → fair price
+
+    # ──────────────────────── Order helpers ────────────────────
+
+    def take_asks(
+        self,
+        product: str,
+        od: OrderDepth,
+        max_px: float,
+        pos: int,
+        limit: int,
+        cap: Optional[int] = None,
+    ) -> List[Order]:
+        """Buy all resting ask orders at prices ≤ max_px, up to cap units."""
+        orders: List[Order] = []
+        room = limit - pos
         if cap is not None:
             room = min(room, cap)
         for px in sorted(od.sell_orders):
@@ -156,8 +210,18 @@ class Trader:
                 room -= qty
         return orders
 
-    def take_bids(self, product, od, min_px, pos, limit, cap=None) -> List[Order]:
-        orders, room = [], limit + pos
+    def take_bids(
+        self,
+        product: str,
+        od: OrderDepth,
+        min_px: float,
+        pos: int,
+        limit: int,
+        cap: Optional[int] = None,
+    ) -> List[Order]:
+        """Sell into all resting bid orders at prices ≥ min_px, up to cap units."""
+        orders: List[Order] = []
+        room = limit + pos
         if cap is not None:
             room = min(room, cap)
         for px in sorted(od.buy_orders, reverse=True):
@@ -169,65 +233,99 @@ class Trader:
                 room -= qty
         return orders
 
-    def trade_osmium(self, state: TradingState, od: OrderDepth, pos: int, mem: Dict) -> List[Order]:
+    # ──────────────────────── Osmium logic ─────────────────────
+
+    def trade_osmium(
+        self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
+    ) -> List[Order]:
+        """
+        Mean-reversion market-making driven by the OU model.
+
+        Quote centre:
+            skewed_fair = μ
+                        − inv_skew   (lean against inventory)
+                        − z_skew     (lean in direction of OU signal)
+
+        Cross threshold:
+            Dynamically tightened when |z| is large so we lift cheap offers /
+            hit expensive bids more aggressively when the OU signal is strongest.
+        """
         product = "ASH_COATED_OSMIUM"
         limit = self.POSITION_LIMITS[product]
         orders: List[Order] = []
 
         bb, ba = self.best_bid_ask(od)
-        mid = self.mid(od)
+        mid = self.micro_price(od)
         if mid is None:
             return orders
 
-        last_mid = mem["last_mid"].get(product, mid)
-        autocorr_fair = 0.5 * (mid + last_mid)
-        raw_fair = 0.82 * autocorr_fair + 0.18 * self.OSMIUM_LONG_MEAN
+        ts = state.timestamp
 
+        # ── OU fair value & signal ──────────────────────────────────────────
+        mu = self.ou_update_mu(mid, mem)
+        z = self.ou_z_score(mid, mu)      # signed OU deviation in units of σ_ou
+        abs_z = abs(z)
+
+        # Imbalance: small nudge toward heavier side (short-term pressure)
         imbalance = self.order_book_imbalance(od, 3)
-        regime = self.regime(product, mem)
+        imb_nudge = 0.6 * imbalance       # ≤ 0.6 ticks
 
-        imb_shift = 0.0
-        if regime == "pressure":
-            imb_shift = 1.2 * imbalance
-        elif regime == "mean_revert":
-            imb_shift = 0.5 * imbalance
+        # Quote centre with combined skew
+        inv = pos / limit                 # ∈ [−1, 1]
+        inv_skew = 3.5 * inv             # lean away from inventory
+        z_skew = 1.2 * max(-2.0, min(2.0, z))  # lean in direction of OU signal
+        skewed_fair = mu - inv_skew - z_skew + imb_nudge
 
-        raw_fair += imb_shift
-        prev_fair = mem.get("osmium_adj_fair", raw_fair)
-        fair = 0.62 * raw_fair + 0.38 * prev_fair
-        mem["osmium_adj_fair"] = fair
-
-        inv = pos / limit
-        skew = 4.0 * inv
-        if regime == "volatile":
-            skew += 0.8 * inv
-            cross_thresh = 4
-            half_spread = 4
-        else:
-            cross_thresh = 3
-            half_spread = 3
-
-        skewed_fair = fair - skew
-
-        orders.extend(self.take_asks(product, od, skewed_fair - cross_thresh, pos, limit))
-        pos_a = pos + sum(o.quantity for o in orders)
-        orders.extend(self.take_bids(product, od, skewed_fair + cross_thresh, pos_a, limit))
-        pos_a = pos + sum(o.quantity for o in orders)
-
-        if state.timestamp > 930_000:
-            if pos_a > 0 and bb is not None:
-                orders.append(Order(product, bb, -min(pos_a, limit + pos_a)))
-            elif pos_a < 0 and ba is not None:
-                orders.append(Order(product, ba, min(-pos_a, limit - pos_a)))
+        # ── End-of-day unwind ──────────────────────────────────────────────
+        if ts > 940_000:
+            if pos > 0 and bb is not None:
+                orders.append(Order(product, bb, -pos))
+            elif pos < 0 and ba is not None:
+                orders.append(Order(product, ba, -pos))
             return orders
 
+        # ── Dynamic cross threshold (driven by OU z-score) ────────────────
+        # The larger |z|, the more mispriced the market is → be more aggressive
+        if abs_z >= 2.0:
+            cross_thresh = 1
+        elif abs_z >= 1.5:
+            cross_thresh = 2
+        elif abs_z >= 0.8:
+            cross_thresh = 3
+        else:
+            cross_thresh = 4   # near equilibrium: conservative, let MM do the work
+
+        # ── Aggressive crossing: take mispriced resting liquidity ──────────
+        # Buy when ask is cheap (below our skewed fair minus threshold)
+        orders.extend(
+            self.take_asks(product, od, skewed_fair - cross_thresh, pos, limit)
+        )
+        pos_a = pos + sum(o.quantity for o in orders)
+
+        # Sell when bid is expensive (above our skewed fair plus threshold)
+        orders.extend(
+            self.take_bids(product, od, skewed_fair + cross_thresh, pos_a, limit)
+        )
+        pos_a = pos + sum(o.quantity for o in orders)
+
+        # ── Passive quoting ────────────────────────────────────────────────
+        # Dynamic half-spread: wider when local vol is elevated
+        lv = self.local_vol(mem["mid_hist"][product])
+        half_spread = max(2, min(5, round(lv * 0.75)))
+
+        # Size: larger when OU signal & inventory both support the direction,
+        #       smaller when near the limit or when z is near 0.
         inv_a = pos_a / limit
-        size = max(5, 14 - int(8 * abs(inv_a)))
-        if regime == "volatile":
-            size = max(4, size - 2)
+        base_size = max(5, 16 - int(8 * abs(inv_a)))
+
+        # Boost size when OU strongly supports the trade direction
+        if (z < -1.0 and pos_a < limit * 0.6) or (z > 1.0 and pos_a > -limit * 0.6):
+            base_size = min(base_size + 4, 22)
 
         bid_px = math.floor(skewed_fair - half_spread)
         ask_px = math.ceil(skewed_fair + half_spread)
+
+        # Don't place orders behind the inside market (queue waste)
         if bb is not None:
             bid_px = min(bid_px, bb + 1)
         if ba is not None:
@@ -239,103 +337,114 @@ class Trader:
         sell_cap = max(0, limit + pos_a)
 
         if buy_cap > 0:
-            orders.append(Order(product, bid_px, min(size, buy_cap)))
+            orders.append(Order(product, bid_px, min(base_size, buy_cap)))
         if sell_cap > 0:
-            orders.append(Order(product, ask_px, -min(size, sell_cap)))
+            orders.append(Order(product, ask_px, -min(base_size, sell_cap)))
 
         return orders
 
-    def pepper_fair(self, ts: int, mid: float, mem: Dict) -> float:
-        obs_intercept = mid - self.PEPPER_SLOPE * ts
-        stored = mem.get("pepper_intercept")
-        if stored is None:
-            mem["pepper_intercept"] = obs_intercept
-            return mid
-        alpha = 0.15 if ts < 20_000 else 0.01
-        mem["pepper_intercept"] = (1 - alpha) * stored + alpha * obs_intercept
-        return mem["pepper_intercept"] + self.PEPPER_SLOPE * ts
+    # ──────────────────────── Pepper logic ─────────────────────
 
-    def target_pos_pepper(self, ts: int, regime: str) -> int:
+    def target_pos_pepper(self, ts: int) -> int:
+        """
+        Step-down target position for Pepper.
+        We hold max long throughout the day (trend-riding) and unwind in stages
+        so we're flat before the final mark-to-market.
+        """
         if ts < 870_000:
             return 50
-        if ts < 930_000:
+        if ts < 920_000:
             return 30
-        if ts < 965_000:
+        if ts < 960_000:
             return 10
         return 0
 
-    def trade_pepper(self, state: TradingState, od: OrderDepth, pos: int, mem: Dict) -> List[Order]:
+    def trade_pepper(
+        self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
+    ) -> List[Order]:
+        """
+        Trend-riding with Kalman-filtered fair value.
+
+        Strategy
+        ────────
+        • Maintain max long position (50) throughout the uptrend.
+        • Fair value from Kalman filter tracking the linear intercept.
+        • Aggressive buying early (large threshold above fair) to build the book.
+        • Step-down target near end-of-day for clean unwind.
+        • Passive ask placed well above fair so we don't accidentally sell early.
+        """
         product = "INTARIAN_PEPPER_ROOT"
         limit = self.POSITION_LIMITS[product]
         orders: List[Order] = []
 
         bb, ba = self.best_bid_ask(od)
-        mid = self.mid(od)
+        mid = self.micro_price(od)
         if mid is None:
             return orders
 
         ts = state.timestamp
-        regime = self.regime(product, mem)
+
+        # ── Kalman-filtered fair value ─────────────────────────────────────
+        fair = self.kf_update(ts, mid, mem)
+
+        # Small imbalance nudge (keep it tiny – trend already supplies the edge)
         imbalance = self.order_book_imbalance(od, 3)
+        fair += 0.25 * max(0.0, imbalance)   # only positive imbalance adds to buy fair
 
-        fair = self.pepper_fair(ts, mid, mem)
-        if regime in ("strong_uptrend", "uptrend"):
-            fair += 0.5 * max(0.0, imbalance)
-        elif regime == "volatile":
-            fair += 0.2 * imbalance
-
-        target = self.target_pos_pepper(ts, regime)
+        target = self.target_pos_pepper(ts)
         pos_a = pos
 
+        # ── Phase 1: Build long position up to target ──────────────────────
         need = max(0, target - pos_a)
         if need > 0:
+            # Accept increasing price premiums early in the day because the
+            # trend advantage far exceeds the crossing cost.
             if ts < 10_000:
-                max_buy = fair + 10
+                max_buy = fair + 12
             elif ts < 50_000:
                 max_buy = fair + 6
             elif ts < 200_000:
-                max_buy = fair + 4
+                max_buy = fair + 3
             elif ts < 800_000:
                 max_buy = fair + 2
             else:
                 max_buy = fair + 1
 
-            if regime == "strong_uptrend" and ts < 200_000:
-                max_buy += 1
-            if regime == "volatile":
-                max_buy -= 1
-
             new = self.take_asks(product, od, max_buy, pos_a, limit, cap=need)
             orders.extend(new)
             pos_a += sum(o.quantity for o in new)
 
+        # ── Phase 2: Trim excess above target ─────────────────────────────
         extra = max(0, pos_a - target)
         if extra > 0:
-            min_sell = fair - 2 if ts > 900_000 else fair + 10
-            if regime == "volatile" and ts < 900_000:
-                min_sell = fair + 6
+            # Never sell cheap mid-day; near end-of-day allow wider margin
+            min_sell = fair - 1 if ts > 900_000 else fair + 8
             new = self.take_bids(product, od, min_sell, pos_a, limit, cap=extra)
             orders.extend(new)
             pos_a += sum(o.quantity for o in new)
 
+        # ── Phase 3: Hard unwind at day end ───────────────────────────────
         if ts > 975_000:
             if pos_a > 0 and bb is not None:
-                orders.append(Order(product, bb, -min(pos_a, limit + pos_a)))
+                orders.append(Order(product, bb, -pos_a))
             elif pos_a < 0 and ba is not None:
-                orders.append(Order(product, ba, min(-pos_a, limit - pos_a)))
+                orders.append(Order(product, ba, -pos_a))
             return orders
 
+        # ── Phase 4: Passive quoting ───────────────────────────────────────
         buy_cap = max(0, limit - pos_a)
         sell_cap = max(0, limit + pos_a)
 
-        bid_px = math.floor(fair + 1)
+        # Bid: just above Kalman fair to stay at top of queue
+        bid_px = math.floor(fair + 0.5)
         if bb is not None:
             bid_px = min(bid_px, bb + 1)
 
+        # Ask: well above fair unless we're reducing or near EoD
         if pos_a > target or ts > 880_000:
             ask_px = math.ceil(fair + 2)
         else:
-            ask_px = math.ceil(fair + 20)
+            ask_px = math.ceil(fair + 22)   # won't fill → effectively hold position
         if ba is not None:
             ask_px = max(ask_px, ba - 1)
         if bid_px >= ask_px:
@@ -343,8 +452,6 @@ class Trader:
 
         if pos_a < target and buy_cap > 0:
             size = min(buy_cap, max(10, target - pos_a))
-            if regime == "volatile":
-                size = max(5, size - 4)
             orders.append(Order(product, bid_px, size))
 
         if (pos_a > target or ts > 900_000) and sell_cap > 0:
@@ -353,6 +460,8 @@ class Trader:
                 orders.append(Order(product, ask_px, -size))
 
         return orders
+
+    # ──────────────────────── Run ───────────────────────────────
 
     def run(self, state: TradingState):
         mem = self.load_state(state.traderData)
@@ -363,21 +472,15 @@ class Trader:
                 result[product] = []
                 continue
 
-            mid = self.mid(od)
-            bb, ba = self.best_bid_ask(od)
+            mid = self.micro_price(od)
             if mid is not None:
                 self.push_hist(mem["mid_hist"][product], mid)
-            if bb is not None and ba is not None:
-                self.push_hist(mem["spread_hist"][product], ba - bb)
-            self.push_hist(mem["imb_hist"][product], self.order_book_imbalance(od, 3))
 
             pos = state.position.get(product, 0)
+
             if product == "ASH_COATED_OSMIUM":
                 result[product] = self.trade_osmium(state, od, pos, mem)
             else:
                 result[product] = self.trade_pepper(state, od, pos, mem)
-
-            if mid is not None:
-                mem["last_mid"][product] = mid
 
         return result, 0, self.dump_state(mem)
