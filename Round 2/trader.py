@@ -85,6 +85,23 @@ class Trader:
         return (bid_vol * ask_vwap + ask_vol * bid_vwap) / (bid_vol + ask_vol)
 
     @staticmethod
+    def _three_level_microprice(od: OrderDepth):
+        bids = [(p, v) for p, v in sorted(od.buy_orders.items(), key=lambda x: -x[0])[:3] if v > 0]
+        asks = [(p, -v) for p, v in sorted(od.sell_orders.items(), key=lambda x: x[0])[:3] if -v > 0]
+        if not bids or not asks:
+            return None
+
+        bid_vol = sum(v for _, v in bids)
+        ask_vol = sum(v for _, v in asks)
+        if bid_vol <= 0 or ask_vol <= 0:
+            return None
+
+        bid_vwap = sum(p * v for p, v in bids) / bid_vol
+        ask_vwap = sum(p * v for p, v in asks) / ask_vol
+
+        return (bid_vol * ask_vwap + ask_vol * bid_vwap) / (bid_vol + ask_vol)
+
+    @staticmethod
     def _sorted_asks(od: OrderDepth):
         return sorted(((p, -v) for p, v in od.sell_orders.items()), key=lambda x: x[0])
 
@@ -99,9 +116,11 @@ class Trader:
             return orders
         best_bid, bbv, best_ask, bav = tob
 
-        micro = self._two_level_microprice(od)
+        micro = self._three_level_microprice(od)
         if micro is None:
-            micro = (bbv * best_ask + bav * best_bid) / (bbv + bav)
+            micro = self._two_level_microprice(od)
+            if micro is None:
+                micro = (bbv * best_ask + bav * best_bid) / (bbv + bav)
         mid = (best_bid + best_ask) / 2.0
         last_move = 0.0 if self._osm_last_mid is None else (mid - self._osm_last_mid)
 
