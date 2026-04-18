@@ -8,7 +8,7 @@ POS_LIMIT = {OSM: 80, PEP: 80}
 # Tuned as a gentle step away from the current best (realopt_plus),
 # not from the worse plus2 branch.
 OSM_FAIR = 10000
-OSM_MICRO_WEIGHT = 0.17
+OSM_MICRO_WEIGHT = 0.18
 OSM_BASE_TAKE_EDGE = 1.0
 OSM_JUMP_TAKE_EDGE = 0.5
 OSM_BASE_MAKE_EDGE_1 = 4
