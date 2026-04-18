@@ -5,16 +5,21 @@ OSM = "ASH_COATED_OSMIUM"
 PEP = "INTARIAN_PEPPER_ROOT"
 POS_LIMIT = {OSM: 80, PEP: 80}
 
-# Close-to-original, data-driven tweaks only
+# Keep the best-so-far structure, only add a slightly stronger short-term OSM reversion layer.
 OSM_FAIR = 10000
-OSM_MICRO_WEIGHT = 0.20
-OSM_TAKE_EDGE = 1.0
-OSM_MAKE_EDGE_1 = 4
-OSM_MAKE_EDGE_2 = 5
+OSM_MICRO_WEIGHT = 0.15
+OSM_BASE_TAKE_EDGE = 1.0
+OSM_JUMP_TAKE_EDGE = 0.5
+OSM_BASE_MAKE_EDGE_1 = 4
+OSM_BASE_MAKE_EDGE_2 = 5
+OSM_JUMP_MAKE_EDGE_1 = 3
+OSM_JUMP_MAKE_EDGE_2 = 5
 OSM_MM_SIZE_1 = 10
 OSM_MM_SIZE_2 = 30
+OSM_JUMP_MM_SIZE_1 = 15
 OSM_POS_SKEW = 0.04
-OSM_RET_REV = 0.15
+OSM_RET_REV = 0.22
+OSM_JUMP_THRESHOLD = 3.0
 
 PEP_PRIOR_DRIFT = 0.10
 PEP_HOLD_HORIZON = 80
@@ -77,9 +82,20 @@ class Trader:
 
         micro = (bbv * best_ask + bav * best_bid) / (bbv + bav)
         mid = (best_bid + best_ask) / 2.0
-        fair = (1 - OSM_MICRO_WEIGHT) * OSM_FAIR + OSM_MICRO_WEIGHT * micro
-        if self._osm_last_mid is not None:
-            fair -= OSM_RET_REV * (mid - self._osm_last_mid)
+        last_move = 0.0 if self._osm_last_mid is None else (mid - self._osm_last_mid)
+
+        fair = (1 - OSM_MICRO_WEIGHT) * OSM_FAIR + OSM_MICRO_WEIGHT * micro - OSM_RET_REV * last_move
+
+        if abs(last_move) >= OSM_JUMP_THRESHOLD:
+            take_edge = OSM_JUMP_TAKE_EDGE
+            make_edge_1 = OSM_JUMP_MAKE_EDGE_1
+            make_edge_2 = OSM_JUMP_MAKE_EDGE_2
+            mm_size_1 = OSM_JUMP_MM_SIZE_1
+        else:
+            take_edge = OSM_BASE_TAKE_EDGE
+            make_edge_1 = OSM_BASE_MAKE_EDGE_1
+            make_edge_2 = OSM_BASE_MAKE_EDGE_2
+            mm_size_1 = OSM_MM_SIZE_1
 
         limit = POS_LIMIT[OSM]
         buy_cap = limit - position
@@ -88,7 +104,7 @@ class Trader:
         for p, v in self._sorted_asks(od):
             if buy_cap <= 0:
                 break
-            if p < fair - OSM_TAKE_EDGE + 1e-6:
+            if p < fair - take_edge + 1e-6:
                 q = min(v, buy_cap)
                 if q > 0:
                     orders.append(Order(OSM, p, q))
@@ -100,7 +116,7 @@ class Trader:
         for p, v in self._sorted_bids(od):
             if sell_cap <= 0:
                 break
-            if p > fair + OSM_TAKE_EDGE - 1e-6:
+            if p > fair + take_edge - 1e-6:
                 q = min(v, sell_cap)
                 if q > 0:
                     orders.append(Order(OSM, p, -q))
@@ -110,10 +126,10 @@ class Trader:
                 break
 
         pos_skew = position * OSM_POS_SKEW
-        inner_bid = int(round(fair - OSM_MAKE_EDGE_1 - pos_skew))
-        outer_bid = int(round(fair - OSM_MAKE_EDGE_2 - pos_skew))
-        inner_ask = int(round(fair + OSM_MAKE_EDGE_1 - pos_skew))
-        outer_ask = int(round(fair + OSM_MAKE_EDGE_2 - pos_skew))
+        inner_bid = int(round(fair - make_edge_1 - pos_skew))
+        outer_bid = int(round(fair - make_edge_2 - pos_skew))
+        inner_ask = int(round(fair + make_edge_1 - pos_skew))
+        outer_ask = int(round(fair + make_edge_2 - pos_skew))
 
         inner_bid = min(inner_bid, best_ask - 1)
         outer_bid = min(outer_bid, best_ask - 1)
@@ -121,7 +137,7 @@ class Trader:
         outer_ask = max(outer_ask, best_bid + 1)
 
         if buy_cap > 0:
-            q1 = min(OSM_MM_SIZE_1, buy_cap)
+            q1 = min(mm_size_1, buy_cap)
             orders.append(Order(OSM, inner_bid, q1))
             buy_cap -= q1
         if buy_cap > 0 and outer_bid < inner_bid:
@@ -129,7 +145,7 @@ class Trader:
             orders.append(Order(OSM, outer_bid, q2))
 
         if sell_cap > 0:
-            q1 = min(OSM_MM_SIZE_1, sell_cap)
+            q1 = min(mm_size_1, sell_cap)
             orders.append(Order(OSM, inner_ask, -q1))
             sell_cap -= q1
         if sell_cap > 0 and outer_ask > inner_ask:
