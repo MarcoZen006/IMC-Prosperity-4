@@ -34,15 +34,19 @@ OSM_INV_CAUTION_SAME_SIDE_TAKE_PENALTY = 0.15
 OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY = 0.40
 OSM_INV_DANGER_OPPOSITE_TAKE_BONUS = 0.25
 
-# Inventory hold permission:
-# if current inventory is supported by book pressure + microprice slope,
-# allow it to live a bit longer by reducing opposite-side unwind aggression.
-OSM_HOLD_PRESSURE_THRESH = 0.18
-OSM_HOLD_SLOPE_THRESH = 0.08
+# Combined hold logic from Traders 31, 33, and 36:
+# - Trader 31 baseline hold-permission behavior
+# - Trader 33 hysteresis on hold entry/exit
+# - Trader 36 inventory-size-dependent activation
+OSM_HOLD_PRESSURE_ON = 0.18
+OSM_HOLD_PRESSURE_OFF = 0.08
+OSM_HOLD_SLOPE_ON = 0.08
+OSM_HOLD_SLOPE_OFF = 0.03
 OSM_HOLD_UNWIND_PENALTY = 0.18
 OSM_HOLD_UNWIND_QUOTE_WIDEN = 1
 OSM_HOLD_FLIP_UNWIND_BONUS = 0.20
 OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN = 1
+OSM_LARGE_UNWIND_QUOTE_TIGHTEN = 1
 
 PEP_PRIOR_DRIFT = 0.10
 PEP_HOLD_HORIZON = 80
@@ -63,6 +67,8 @@ class Trader:
         self._pep_mid_history: List[float] = []
         self._osm_last_mid: float | None = None
         self._osm_last_micro: float | None = None
+        self._osm_long_hold_mode = False
+        self._osm_short_hold_mode = False
 
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
@@ -131,6 +137,33 @@ class Trader:
     def _sorted_bids(od: OrderDepth):
         return sorted(od.buy_orders.items(), key=lambda x: -x[0])
 
+    def _update_osmium_hold_modes(self, position: int, pressure: float, micro_slope: float):
+        prev_long_hold = self._osm_long_hold_mode
+        prev_short_hold = self._osm_short_hold_mode
+
+        if position > 0:
+            self._osm_short_hold_mode = False
+            if self._osm_long_hold_mode:
+                if pressure < OSM_HOLD_PRESSURE_OFF or micro_slope < OSM_HOLD_SLOPE_OFF:
+                    self._osm_long_hold_mode = False
+            elif pressure > OSM_HOLD_PRESSURE_ON and micro_slope > OSM_HOLD_SLOPE_ON:
+                self._osm_long_hold_mode = True
+        elif position < 0:
+            self._osm_long_hold_mode = False
+            if self._osm_short_hold_mode:
+                if pressure > -OSM_HOLD_PRESSURE_OFF or micro_slope > -OSM_HOLD_SLOPE_OFF:
+                    self._osm_short_hold_mode = False
+            elif pressure < -OSM_HOLD_PRESSURE_ON and micro_slope < -OSM_HOLD_SLOPE_ON:
+                self._osm_short_hold_mode = True
+        else:
+            self._osm_long_hold_mode = False
+            self._osm_short_hold_mode = False
+
+        long_lost_support = prev_long_hold and not self._osm_long_hold_mode
+        short_lost_support = prev_short_hold and not self._osm_short_hold_mode
+
+        return self._osm_long_hold_mode, self._osm_short_hold_mode, long_lost_support, short_lost_support
+
     def _trade_osmium(self, od: OrderDepth, position: int) -> List[Order]:
         orders: List[Order] = []
         tob = self._top_of_book(od)
@@ -176,10 +209,20 @@ class Trader:
         ask_quote_shift = 0
         bid_quote_shift = 0
 
-        long_supported = pressure > OSM_HOLD_PRESSURE_THRESH and micro_slope > OSM_HOLD_SLOPE_THRESH
-        short_supported = pressure < -OSM_HOLD_PRESSURE_THRESH and micro_slope < -OSM_HOLD_SLOPE_THRESH
-        long_lost_support = pressure <= 0.0 or micro_slope <= 0.0
-        short_lost_support = pressure >= 0.0 or micro_slope >= 0.0
+        hold_small = abs_pos < OSM_INV_BAND_Q1
+        hold_medium = OSM_INV_BAND_Q1 <= abs_pos <= OSM_INV_BAND_Q2
+        hold_large = abs_pos > OSM_INV_BAND_Q2
+
+        long_hold_mode, short_hold_mode, long_lost_support, short_lost_support = self._update_osmium_hold_modes(
+            position, pressure, micro_slope
+        )
+
+        # Large inventory disables hold permission entirely.
+        if hold_large:
+            long_hold_mode = False
+            short_hold_mode = False
+            long_lost_support = False
+            short_lost_support = False
 
         if position > 0:
             if OSM_INV_BAND_Q1 < abs_pos <= OSM_INV_BAND_Q2:
@@ -191,15 +234,17 @@ class Trader:
                 allow_outer_bid = False
                 if pressure < OSM_INV_WEAK_PRESSURE:
                     buy_take_edge += OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY
-                if not long_supported:
-                    sell_take_edge = max(0.0, sell_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
+                sell_take_edge = max(0.0, sell_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
 
-            if long_supported:
-                sell_take_edge += OSM_HOLD_UNWIND_PENALTY
-                ask_quote_shift += OSM_HOLD_UNWIND_QUOTE_WIDEN
-            elif long_lost_support:
-                sell_take_edge = max(0.0, sell_take_edge - OSM_HOLD_FLIP_UNWIND_BONUS)
-                ask_quote_shift -= OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN
+            if hold_medium:
+                if long_hold_mode:
+                    sell_take_edge += OSM_HOLD_UNWIND_PENALTY
+                    ask_quote_shift += OSM_HOLD_UNWIND_QUOTE_WIDEN
+                elif long_lost_support:
+                    sell_take_edge = max(0.0, sell_take_edge - OSM_HOLD_FLIP_UNWIND_BONUS)
+                    ask_quote_shift -= OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN
+            elif hold_large:
+                ask_quote_shift -= OSM_LARGE_UNWIND_QUOTE_TIGHTEN
 
         elif position < 0:
             if OSM_INV_BAND_Q1 < abs_pos <= OSM_INV_BAND_Q2:
@@ -211,15 +256,17 @@ class Trader:
                 allow_outer_ask = False
                 if pressure > -OSM_INV_WEAK_PRESSURE:
                     sell_take_edge += OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY
-                if not short_supported:
-                    buy_take_edge = max(0.0, buy_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
+                buy_take_edge = max(0.0, buy_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
 
-            if short_supported:
-                buy_take_edge += OSM_HOLD_UNWIND_PENALTY
-                bid_quote_shift -= OSM_HOLD_UNWIND_QUOTE_WIDEN
-            elif short_lost_support:
-                buy_take_edge = max(0.0, buy_take_edge - OSM_HOLD_FLIP_UNWIND_BONUS)
-                bid_quote_shift += OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN
+            if hold_medium:
+                if short_hold_mode:
+                    buy_take_edge += OSM_HOLD_UNWIND_PENALTY
+                    bid_quote_shift -= OSM_HOLD_UNWIND_QUOTE_WIDEN
+                elif short_lost_support:
+                    buy_take_edge = max(0.0, buy_take_edge - OSM_HOLD_FLIP_UNWIND_BONUS)
+                    bid_quote_shift += OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN
+            elif hold_large:
+                bid_quote_shift += OSM_LARGE_UNWIND_QUOTE_TIGHTEN
 
         for p, v in self._sorted_asks(od):
             if buy_cap <= 0:
