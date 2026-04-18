@@ -5,9 +5,10 @@ OSM = "ASH_COATED_OSMIUM"
 PEP = "INTARIAN_PEPPER_ROOT"
 POS_LIMIT = {OSM: 80, PEP: 80}
 
-# Keep the best-so-far structure, only add a slightly stronger short-term OSM reversion layer.
+# Tuned as a gentle step away from the current best (realopt_plus),
+# not from the worse plus2 branch.
 OSM_FAIR = 10000
-OSM_MICRO_WEIGHT = 0.15
+OSM_MICRO_WEIGHT = 0.18
 OSM_BASE_TAKE_EDGE = 1.0
 OSM_JUMP_TAKE_EDGE = 0.5
 OSM_BASE_MAKE_EDGE_1 = 4
@@ -16,9 +17,9 @@ OSM_JUMP_MAKE_EDGE_1 = 3
 OSM_JUMP_MAKE_EDGE_2 = 5
 OSM_MM_SIZE_1 = 10
 OSM_MM_SIZE_2 = 30
-OSM_JUMP_MM_SIZE_1 = 15
+OSM_JUMP_MM_SIZE_1 = 14
 OSM_POS_SKEW = 0.04
-OSM_RET_REV = 0.22
+OSM_RET_REV = 0.24
 OSM_JUMP_THRESHOLD = 3.0
 
 PEP_PRIOR_DRIFT = 0.10
