@@ -23,15 +23,16 @@ OSM_POS_SKEW = 0.04
 OSM_RET_REV = 0.12
 OSM_JUMP_THRESHOLD = 3.0
 
-# Asymmetric Osmium inventory control:
-# penalize only the side that would add more of the current inventory,
-# while keeping unwind activity mostly normal.
+# Discrete-band Osmium inventory control:
+# normal zone     : trade normally
+# caution zone    : remove the inner same-side passive quote, keep the outer quote
+# danger zone     : remove all same-side passive quotes and make opposite-side unwind easier
 OSM_INV_WEAK_PRESSURE = 0.20
-OSM_INV_SAME_SIDE_TAKE_PENALTY = 0.35
-OSM_INV_OPPOSITE_TAKE_BONUS = 0.15
-OSM_INV_SAME_SIDE_PASSIVE_PENALTY_1 = 2.0
-OSM_INV_SAME_SIDE_PASSIVE_PENALTY_2 = 3.0
-OSM_INV_SAME_SIDE_PASSIVE_SIZE_CUT = 0.75
+OSM_INV_BAND_Q1 = 20
+OSM_INV_BAND_Q2 = 45
+OSM_INV_CAUTION_SAME_SIDE_TAKE_PENALTY = 0.15
+OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY = 0.40
+OSM_INV_DANGER_OPPOSITE_TAKE_BONUS = 0.25
 
 PEP_PRIOR_DRIFT = 0.10
 PEP_HOLD_HORIZON = 80
@@ -152,32 +153,37 @@ class Trader:
         sell_cap = limit + position
 
         pressure = micro - mid
-        long_ratio = max(position, 0) / limit
-        short_ratio = max(-position, 0) / limit
+        abs_pos = abs(position)
 
         buy_take_edge = take_edge
         sell_take_edge = take_edge
-        bid_passive_penalty_1 = 0.0
-        bid_passive_penalty_2 = 0.0
-        ask_passive_penalty_1 = 0.0
-        ask_passive_penalty_2 = 0.0
-        bid_passive_mult = 1.0
-        ask_passive_mult = 1.0
+        allow_inner_bid = True
+        allow_outer_bid = True
+        allow_inner_ask = True
+        allow_outer_ask = True
 
         if position > 0:
-            bid_passive_penalty_1 = OSM_INV_SAME_SIDE_PASSIVE_PENALTY_1 * long_ratio
-            bid_passive_penalty_2 = OSM_INV_SAME_SIDE_PASSIVE_PENALTY_2 * long_ratio
-            bid_passive_mult = max(0.25, 1.0 - OSM_INV_SAME_SIDE_PASSIVE_SIZE_CUT * long_ratio)
-            if pressure < OSM_INV_WEAK_PRESSURE:
-                buy_take_edge += OSM_INV_SAME_SIDE_TAKE_PENALTY * long_ratio
-            sell_take_edge = max(0.0, sell_take_edge - OSM_INV_OPPOSITE_TAKE_BONUS * long_ratio)
+            if OSM_INV_BAND_Q1 < abs_pos <= OSM_INV_BAND_Q2:
+                allow_inner_bid = False
+                if pressure < OSM_INV_WEAK_PRESSURE:
+                    buy_take_edge += OSM_INV_CAUTION_SAME_SIDE_TAKE_PENALTY
+            elif abs_pos > OSM_INV_BAND_Q2:
+                allow_inner_bid = False
+                allow_outer_bid = False
+                if pressure < OSM_INV_WEAK_PRESSURE:
+                    buy_take_edge += OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY
+                sell_take_edge = max(0.0, sell_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
         elif position < 0:
-            ask_passive_penalty_1 = OSM_INV_SAME_SIDE_PASSIVE_PENALTY_1 * short_ratio
-            ask_passive_penalty_2 = OSM_INV_SAME_SIDE_PASSIVE_PENALTY_2 * short_ratio
-            ask_passive_mult = max(0.25, 1.0 - OSM_INV_SAME_SIDE_PASSIVE_SIZE_CUT * short_ratio)
-            if pressure > -OSM_INV_WEAK_PRESSURE:
-                sell_take_edge += OSM_INV_SAME_SIDE_TAKE_PENALTY * short_ratio
-            buy_take_edge = max(0.0, buy_take_edge - OSM_INV_OPPOSITE_TAKE_BONUS * short_ratio)
+            if OSM_INV_BAND_Q1 < abs_pos <= OSM_INV_BAND_Q2:
+                allow_inner_ask = False
+                if pressure > -OSM_INV_WEAK_PRESSURE:
+                    sell_take_edge += OSM_INV_CAUTION_SAME_SIDE_TAKE_PENALTY
+            elif abs_pos > OSM_INV_BAND_Q2:
+                allow_inner_ask = False
+                allow_outer_ask = False
+                if pressure > -OSM_INV_WEAK_PRESSURE:
+                    sell_take_edge += OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY
+                buy_take_edge = max(0.0, buy_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
 
         for p, v in self._sorted_asks(od):
             if buy_cap <= 0:
@@ -203,31 +209,36 @@ class Trader:
             else:
                 break
 
-        inner_bid = int(round(fair - make_edge_1 - bid_passive_penalty_1))
-        outer_bid = int(round(fair - make_edge_2 - bid_passive_penalty_2))
-        inner_ask = int(round(fair + make_edge_1 + ask_passive_penalty_1))
-        outer_ask = int(round(fair + make_edge_2 + ask_passive_penalty_2))
+        inner_bid = int(round(fair - make_edge_1))
+        outer_bid = int(round(fair - make_edge_2))
+        inner_ask = int(round(fair + make_edge_1))
+        outer_ask = int(round(fair + make_edge_2))
 
         inner_bid = min(inner_bid, best_ask - 1)
         outer_bid = min(outer_bid, best_ask - 1)
         inner_ask = max(inner_ask, best_bid + 1)
         outer_ask = max(outer_ask, best_bid + 1)
 
-        if buy_cap > 0:
-            q1 = min(max(1, int(round(mm_size_1 * bid_passive_mult))), buy_cap)
-            orders.append(Order(OSM, inner_bid, q1))
-            buy_cap -= q1
-        if buy_cap > 0 and outer_bid < inner_bid:
-            q2 = min(max(1, int(round(OSM_MM_SIZE_2 * bid_passive_mult))), buy_cap)
-            orders.append(Order(OSM, outer_bid, q2))
+        if buy_cap > 0 and allow_inner_bid:
+            q1 = min(mm_size_1, buy_cap)
+            if q1 > 0:
+                orders.append(Order(OSM, inner_bid, q1))
+                buy_cap -= q1
+        if buy_cap > 0 and allow_outer_bid and outer_bid < inner_bid:
+            q2 = min(OSM_MM_SIZE_2, buy_cap)
+            if q2 > 0:
+                orders.append(Order(OSM, outer_bid, q2))
+                buy_cap -= q2
 
-        if sell_cap > 0:
-            q1 = min(max(1, int(round(mm_size_1 * ask_passive_mult))), sell_cap)
-            orders.append(Order(OSM, inner_ask, -q1))
-            sell_cap -= q1
-        if sell_cap > 0 and outer_ask > inner_ask:
-            q2 = min(max(1, int(round(OSM_MM_SIZE_2 * ask_passive_mult))), sell_cap)
-            orders.append(Order(OSM, outer_ask, -q2))
+        if sell_cap > 0 and allow_inner_ask:
+            q1 = min(mm_size_1, sell_cap)
+            if q1 > 0:
+                orders.append(Order(OSM, inner_ask, -q1))
+                sell_cap -= q1
+        if sell_cap > 0 and allow_outer_ask and outer_ask > inner_ask:
+            q2 = min(OSM_MM_SIZE_2, sell_cap)
+            if q2 > 0:
+                orders.append(Order(OSM, outer_ask, -q2))
 
         self._osm_last_mid = mid
         return orders
