@@ -5,13 +5,13 @@ OSM = "ASH_COATED_OSMIUM"
 PEP = "INTARIAN_PEPPER_ROOT"
 POS_LIMIT = {OSM: 80, PEP: 80}
 
-# Osmium: keep the original Trader 11/17 shell, but lean harder into the
-# 2-level book signal and only retune the parameters that directly interact
-# with that better state estimate.
+# Osmium: keep the validated Trader 18 shell and lean a little further into the
+# only change family that has actually improved PnL so far: better book signal
+# + lighter short-term mean reversion + slightly more aggressive taking.
 OSM_FAIR = 10000
-OSM_MICRO_WEIGHT = 0.28
-OSM_BASE_TAKE_EDGE = 0.75
-OSM_JUMP_TAKE_EDGE = 0.5
+OSM_MICRO_WEIGHT = 0.34
+OSM_BASE_TAKE_EDGE = 0.50
+OSM_JUMP_TAKE_EDGE = 0.25
 OSM_BASE_MAKE_EDGE_1 = 4
 OSM_BASE_MAKE_EDGE_2 = 5
 OSM_JUMP_MAKE_EDGE_1 = 3
@@ -20,7 +20,7 @@ OSM_MM_SIZE_1 = 10
 OSM_MM_SIZE_2 = 30
 OSM_JUMP_MM_SIZE_1 = 15
 OSM_POS_SKEW = 0.04
-OSM_RET_REV = 0.18
+OSM_RET_REV = 0.12
 OSM_JUMP_THRESHOLD = 3.0
 
 PEP_PRIOR_DRIFT = 0.10
