@@ -34,6 +34,16 @@ OSM_INV_CAUTION_SAME_SIDE_TAKE_PENALTY = 0.15
 OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY = 0.40
 OSM_INV_DANGER_OPPOSITE_TAKE_BONUS = 0.25
 
+# Inventory hold permission:
+# if current inventory is supported by book pressure + microprice slope,
+# allow it to live a bit longer by reducing opposite-side unwind aggression.
+OSM_HOLD_PRESSURE_THRESH = 0.18
+OSM_HOLD_SLOPE_THRESH = 0.08
+OSM_HOLD_UNWIND_PENALTY = 0.18
+OSM_HOLD_UNWIND_QUOTE_WIDEN = 1
+OSM_HOLD_FLIP_UNWIND_BONUS = 0.20
+OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN = 1
+
 PEP_PRIOR_DRIFT = 0.10
 PEP_HOLD_HORIZON = 80
 PEP_MAKE_EDGE_BID = 1
@@ -52,6 +62,7 @@ class Trader:
     def __init__(self):
         self._pep_mid_history: List[float] = []
         self._osm_last_mid: float | None = None
+        self._osm_last_micro: float | None = None
 
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
@@ -134,6 +145,7 @@ class Trader:
                 micro = (bbv * best_ask + bav * best_bid) / (bbv + bav)
         mid = (best_bid + best_ask) / 2.0
         last_move = 0.0 if self._osm_last_mid is None else (mid - self._osm_last_mid)
+        micro_slope = 0.0 if self._osm_last_micro is None else (micro - self._osm_last_micro)
 
         fair = (1 - OSM_MICRO_WEIGHT) * OSM_FAIR + OSM_MICRO_WEIGHT * micro - OSM_RET_REV * last_move
 
@@ -161,6 +173,13 @@ class Trader:
         allow_outer_bid = True
         allow_inner_ask = True
         allow_outer_ask = True
+        ask_quote_shift = 0
+        bid_quote_shift = 0
+
+        long_supported = pressure > OSM_HOLD_PRESSURE_THRESH and micro_slope > OSM_HOLD_SLOPE_THRESH
+        short_supported = pressure < -OSM_HOLD_PRESSURE_THRESH and micro_slope < -OSM_HOLD_SLOPE_THRESH
+        long_lost_support = pressure <= 0.0 or micro_slope <= 0.0
+        short_lost_support = pressure >= 0.0 or micro_slope >= 0.0
 
         if position > 0:
             if OSM_INV_BAND_Q1 < abs_pos <= OSM_INV_BAND_Q2:
@@ -172,7 +191,16 @@ class Trader:
                 allow_outer_bid = False
                 if pressure < OSM_INV_WEAK_PRESSURE:
                     buy_take_edge += OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY
-                sell_take_edge = max(0.0, sell_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
+                if not long_supported:
+                    sell_take_edge = max(0.0, sell_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
+
+            if long_supported:
+                sell_take_edge += OSM_HOLD_UNWIND_PENALTY
+                ask_quote_shift += OSM_HOLD_UNWIND_QUOTE_WIDEN
+            elif long_lost_support:
+                sell_take_edge = max(0.0, sell_take_edge - OSM_HOLD_FLIP_UNWIND_BONUS)
+                ask_quote_shift -= OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN
+
         elif position < 0:
             if OSM_INV_BAND_Q1 < abs_pos <= OSM_INV_BAND_Q2:
                 allow_inner_ask = False
@@ -183,7 +211,15 @@ class Trader:
                 allow_outer_ask = False
                 if pressure > -OSM_INV_WEAK_PRESSURE:
                     sell_take_edge += OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY
-                buy_take_edge = max(0.0, buy_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
+                if not short_supported:
+                    buy_take_edge = max(0.0, buy_take_edge - OSM_INV_DANGER_OPPOSITE_TAKE_BONUS)
+
+            if short_supported:
+                buy_take_edge += OSM_HOLD_UNWIND_PENALTY
+                bid_quote_shift -= OSM_HOLD_UNWIND_QUOTE_WIDEN
+            elif short_lost_support:
+                buy_take_edge = max(0.0, buy_take_edge - OSM_HOLD_FLIP_UNWIND_BONUS)
+                bid_quote_shift += OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN
 
         for p, v in self._sorted_asks(od):
             if buy_cap <= 0:
@@ -209,10 +245,10 @@ class Trader:
             else:
                 break
 
-        inner_bid = int(round(fair - make_edge_1))
-        outer_bid = int(round(fair - make_edge_2))
-        inner_ask = int(round(fair + make_edge_1))
-        outer_ask = int(round(fair + make_edge_2))
+        inner_bid = int(round(fair - make_edge_1 + bid_quote_shift))
+        outer_bid = int(round(fair - make_edge_2 + bid_quote_shift))
+        inner_ask = int(round(fair + make_edge_1 + ask_quote_shift))
+        outer_ask = int(round(fair + make_edge_2 + ask_quote_shift))
 
         inner_bid = min(inner_bid, best_ask - 1)
         outer_bid = min(outer_bid, best_ask - 1)
@@ -241,6 +277,7 @@ class Trader:
                 orders.append(Order(OSM, outer_ask, -q2))
 
         self._osm_last_mid = mid
+        self._osm_last_micro = micro
         return orders
 
     def _estimate_pepper_drift(self) -> float:
