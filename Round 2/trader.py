@@ -5,11 +5,12 @@ OSM = "ASH_COATED_OSMIUM"
 PEP = "INTARIAN_PEPPER_ROOT"
 POS_LIMIT = {OSM: 80, PEP: 80}
 
-# Tuned as a gentle step away from the current best (realopt_plus),
-# not from the worse plus2 branch.
+# Osmium: keep the original Trader 11/17 shell, but lean harder into the
+# 2-level book signal and only retune the parameters that directly interact
+# with that better state estimate.
 OSM_FAIR = 10000
-OSM_MICRO_WEIGHT = 0.18
-OSM_BASE_TAKE_EDGE = 1.0
+OSM_MICRO_WEIGHT = 0.28
+OSM_BASE_TAKE_EDGE = 0.75
 OSM_JUMP_TAKE_EDGE = 0.5
 OSM_BASE_MAKE_EDGE_1 = 4
 OSM_BASE_MAKE_EDGE_2 = 5
@@ -19,7 +20,7 @@ OSM_MM_SIZE_1 = 10
 OSM_MM_SIZE_2 = 30
 OSM_JUMP_MM_SIZE_1 = 15
 OSM_POS_SKEW = 0.04
-OSM_RET_REV = 0.245
+OSM_RET_REV = 0.18
 OSM_JUMP_THRESHOLD = 3.0
 
 PEP_PRIOR_DRIFT = 0.10
