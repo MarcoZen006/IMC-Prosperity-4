@@ -6,18 +6,13 @@ from datamodel import OrderDepth, TradingState, Order
 
 class Trader:
     """
-    Round 3 v3: conservative upgrade of the +PnL baseline.
+    Round 3 v4: stays very close to the best v3 / original microprice bot.
 
-    This intentionally stays close to your original profitable strategy.
-    The previous version lost profit because it changed the behaviour too much.
-
-    Improvements over original:
-    - Same microprice + volatility Avellaneda-style core.
-    - Product-specific but conservative parameters.
-    - Uses tanh imbalance lean instead of a huge theoretical option model.
-    - Uses position-limit clipping so orders do not waste capacity.
-    - Uses traderData persistence as backup memory.
-    - Keeps trading all vouchers, because your original made money doing that.
+    Extra optimisation versus v3:
+    - tiny momentum lean, capped hard so it cannot dominate
+    - endgame risk lock after ~86% of the day
+    - final-phase inventory reduction after ~94% of the day
+    - avoids adding inventory in the wrong direction near the end
     """
 
     POSITION_LIMITS = {
@@ -54,6 +49,7 @@ class Trader:
         self.past_microprices: Dict[str, float] = {}
         self.volatility_ema: Dict[str, float] = {}
         self.mid_ema: Dict[str, float] = {}
+        self.last_micro_diff: Dict[str, float] = {}
 
     def load_state(self, trader_data: str) -> None:
         if not trader_data:
@@ -63,12 +59,18 @@ class Trader:
             self.past_microprices.update({k: float(v) for k, v in data.get("past", {}).items()})
             self.volatility_ema.update({k: float(v) for k, v in data.get("var", {}).items()})
             self.mid_ema.update({k: float(v) for k, v in data.get("ema", {}).items()})
+            self.last_micro_diff.update({k: float(v) for k, v in data.get("diff", {}).items()})
         except Exception:
             pass
 
     def save_state(self) -> str:
         try:
-            return json.dumps({"past": self.past_microprices, "var": self.volatility_ema, "ema": self.mid_ema})
+            return json.dumps({
+                "past": self.past_microprices,
+                "var": self.volatility_ema,
+                "ema": self.mid_ema,
+                "diff": self.last_micro_diff,
+            })
         except Exception:
             return ""
 
@@ -111,7 +113,6 @@ class Trader:
         if product not in self.mid_ema:
             self.mid_ema[product] = mid
         else:
-            # Very small trend filter. Heavy model caused losses, so keep this mild.
             self.mid_ema[product] = 0.04 * mid + 0.96 * self.mid_ema[product]
         return self.mid_ema[product]
 
@@ -122,16 +123,16 @@ class Trader:
         if product not in self.past_microprices:
             self.past_microprices[product] = current_microprice
             self.volatility_ema[product] = 1.0
+            self.last_micro_diff[product] = 0.0
             return 1.0
 
         prev_microprice = self.past_microprices[product]
         diff = current_microprice - prev_microprice
+        self.last_micro_diff[product] = 0.20 * diff + 0.80 * self.last_micro_diff.get(product, 0.0)
         sq_return = diff * diff
 
         current_variance = self.volatility_ema.get(product, 1.0)
         new_variance = alpha * sq_return + (1.0 - alpha) * current_variance
-
-        # Clip only extreme values. Original logic worked, so do not over-control it.
         new_variance = max(0.25, min(new_variance, 10000.0))
 
         self.volatility_ema[product] = new_variance
@@ -148,9 +149,7 @@ class Trader:
         return self.POSITION_LIMITS.get(product, 0) + self.position(state, product)
 
     def add_order(self, state: TradingState, orders: List[Order], product: str, price: int, quantity: int) -> None:
-        if quantity == 0:
-            return
-        if price < 0:
+        if quantity == 0 or price < 0:
             return
 
         if quantity > 0:
@@ -172,11 +171,19 @@ class Trader:
 
         return max(1, int(raw_size * inv_scale))
 
+    def time_fraction(self, timestamp: int) -> float:
+        if timestamp <= 100000:
+            return max(0.0, min(1.0, timestamp / 100000.0))
+        return max(0.0, min(1.0, timestamp / 1000000.0))
+
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         self.load_state(state.traderData)
 
         result: Dict[str, List[Order]] = {}
         conversions = 0
+        day_frac = self.time_fraction(state.timestamp)
+        endgame = day_frac > 0.86
+        final_phase = day_frac > 0.94
 
         for product in state.order_depths:
             if product not in self.POSITION_LIMITS:
@@ -201,40 +208,64 @@ class Trader:
 
             ema = self.update_mid_ema(product, mid)
             imb = self.imbalance(order_depth)
+            momentum = self.last_micro_diff.get(product, 0.0)
+            momentum_lean = max(-1.5, min(1.5, 0.12 * momentum))
 
-            # Mostly original microprice, with tiny EMA/imbalance lean.
-            fair_micro = 0.92 * microprice + 0.08 * ema + params["imb"] * imb
+            fair_micro = 0.91 * microprice + 0.09 * ema + params["imb"] * imb + momentum_lean
 
-            # Original AS inventory penalty, with a smooth extra skew near limits.
-            inventory_penalty = current_position * params["risk"] * variance
-            soft_limit_skew = math.tanh(2.0 * inv_ratio) * (1.0 + 0.15 * vol)
+            risk_mult = 1.0
+            if endgame:
+                risk_mult = 1.35
+            if final_phase:
+                risk_mult = 1.75
+
+            inventory_penalty = current_position * params["risk"] * variance * risk_mult
+            soft_limit_skew = math.tanh(2.0 * inv_ratio) * (1.0 + 0.15 * vol) * risk_mult
             reservation_price = fair_micro - inventory_penalty - soft_limit_skew
 
             dynamic_half_spread = params["spread"] + params["vol_mult"] * vol
-            dynamic_half_spread = max(1.0, min(dynamic_half_spread, 20.0))
+            if endgame:
+                dynamic_half_spread *= 1.12
+            if final_phase:
+                dynamic_half_spread *= 1.25
+            dynamic_half_spread = max(1.0, min(dynamic_half_spread, 24.0))
 
             optimal_bid = math.floor(reservation_price - dynamic_half_spread)
             optimal_ask = math.ceil(reservation_price + dynamic_half_spread)
 
             trade_size = self.dynamic_size(product, variance, current_position)
+            if endgame:
+                trade_size = max(1, int(trade_size * 0.80))
+            if final_phase:
+                trade_size = max(1, int(trade_size * 0.60))
 
-            # Passive market-making quotes, same as original but clipped.
-            if inv_ratio < 0.85:
+            allow_buy_quote = inv_ratio < 0.85 and not (final_phase and current_position > limit * 0.15)
+            allow_sell_quote = inv_ratio > -0.85 and not (final_phase and current_position < -limit * 0.15)
+
+            if allow_buy_quote:
                 self.add_order(state, orders, product, optimal_bid, trade_size)
-            if inv_ratio > -0.85:
+            if allow_sell_quote:
                 self.add_order(state, orders, product, optimal_ask, -trade_size)
 
-            # Aggressive sniping, kept almost identical to original.
             best_bid, best_ask = self.best_bid_ask(order_depth)
             edge = params["edge"]
 
             if best_ask is not None and best_ask < reservation_price - dynamic_half_spread - edge:
-                take_vol = min(abs(order_depth.sell_orders[best_ask]), trade_size)
-                self.add_order(state, orders, product, best_ask, take_vol)
+                if not (final_phase and current_position > 0):
+                    take_vol = min(abs(order_depth.sell_orders[best_ask]), trade_size)
+                    self.add_order(state, orders, product, best_ask, take_vol)
 
             if best_bid is not None and best_bid > reservation_price + dynamic_half_spread + edge:
-                take_vol = min(abs(order_depth.buy_orders[best_bid]), trade_size)
-                self.add_order(state, orders, product, best_bid, -take_vol)
+                if not (final_phase and current_position < 0):
+                    take_vol = min(abs(order_depth.buy_orders[best_bid]), trade_size)
+                    self.add_order(state, orders, product, best_bid, -take_vol)
+
+            if final_phase and abs(current_position) > max(8, int(0.10 * limit)):
+                reduce_size = max(1, min(abs(current_position) // 3, trade_size * 2))
+                if current_position > 0 and best_bid is not None:
+                    self.add_order(state, orders, product, best_bid, -reduce_size)
+                elif current_position < 0 and best_ask is not None:
+                    self.add_order(state, orders, product, best_ask, reduce_size)
 
             result[product] = orders
 
