@@ -6,9 +6,9 @@ from datamodel import OrderDepth, TradingState, Order
 
 class Trader:
     """
-    Round 3 v4: stays very close to the best v3 / original microprice bot.
+    Round 3 v5: stays very close to the best v3 / original microprice bot.
 
-    Extra optimisation versus v3:
+    Extra optimisation versus v4:
     - tiny momentum lean, capped hard so it cannot dominate
     - endgame risk lock after ~86% of the day
     - final-phase inventory reduction after ~94% of the day
@@ -182,8 +182,9 @@ class Trader:
         result: Dict[str, List[Order]] = {}
         conversions = 0
         day_frac = self.time_fraction(state.timestamp)
-        endgame = day_frac > 0.86
-        final_phase = day_frac > 0.94
+        endgame = day_frac > 0.84
+        profit_lock = day_frac > 0.90
+        final_phase = day_frac > 0.92
 
         for product in state.order_depths:
             if product not in self.POSITION_LIMITS:
@@ -216,8 +217,10 @@ class Trader:
             risk_mult = 1.0
             if endgame:
                 risk_mult = 1.35
-            if final_phase:
+            if profit_lock:
                 risk_mult = 1.75
+            if final_phase:
+                risk_mult = 2.35
 
             inventory_penalty = current_position * params["risk"] * variance * risk_mult
             soft_limit_skew = math.tanh(2.0 * inv_ratio) * (1.0 + 0.15 * vol) * risk_mult
@@ -226,8 +229,10 @@ class Trader:
             dynamic_half_spread = params["spread"] + params["vol_mult"] * vol
             if endgame:
                 dynamic_half_spread *= 1.12
+            if profit_lock:
+                dynamic_half_spread *= 1.22
             if final_phase:
-                dynamic_half_spread *= 1.25
+                dynamic_half_spread *= 1.45
             dynamic_half_spread = max(1.0, min(dynamic_half_spread, 24.0))
 
             optimal_bid = math.floor(reservation_price - dynamic_half_spread)
@@ -236,11 +241,13 @@ class Trader:
             trade_size = self.dynamic_size(product, variance, current_position)
             if endgame:
                 trade_size = max(1, int(trade_size * 0.80))
+            if profit_lock:
+                trade_size = max(1, int(trade_size * 0.65))
             if final_phase:
-                trade_size = max(1, int(trade_size * 0.60))
+                trade_size = max(1, int(trade_size * 0.45))
 
-            allow_buy_quote = inv_ratio < 0.85 and not (final_phase and current_position > limit * 0.15)
-            allow_sell_quote = inv_ratio > -0.85 and not (final_phase and current_position < -limit * 0.15)
+            allow_buy_quote = inv_ratio < 0.85 and not (profit_lock and current_position > 0) and not (final_phase and current_position > -limit * 0.05)
+            allow_sell_quote = inv_ratio > -0.85 and not (profit_lock and current_position < 0) and not (final_phase and current_position < limit * 0.05)
 
             if allow_buy_quote:
                 self.add_order(state, orders, product, optimal_bid, trade_size)
@@ -251,17 +258,18 @@ class Trader:
             edge = params["edge"]
 
             if best_ask is not None and best_ask < reservation_price - dynamic_half_spread - edge:
-                if not (final_phase and current_position > 0):
+                if not (profit_lock and current_position >= 0):
                     take_vol = min(abs(order_depth.sell_orders[best_ask]), trade_size)
                     self.add_order(state, orders, product, best_ask, take_vol)
 
             if best_bid is not None and best_bid > reservation_price + dynamic_half_spread + edge:
-                if not (final_phase and current_position < 0):
+                if not (profit_lock and current_position <= 0):
                     take_vol = min(abs(order_depth.buy_orders[best_bid]), trade_size)
                     self.add_order(state, orders, product, best_bid, -take_vol)
 
-            if final_phase and abs(current_position) > max(8, int(0.10 * limit)):
-                reduce_size = max(1, min(abs(current_position) // 3, trade_size * 2))
+            if profit_lock and abs(current_position) > max(4, int(0.04 * limit)):
+                divisor = 2 if final_phase else 3
+                reduce_size = max(1, min(abs(current_position) // divisor, trade_size * 4))
                 if current_position > 0 and best_bid is not None:
                     self.add_order(state, orders, product, best_bid, -reduce_size)
                 elif current_position < 0 and best_ask is not None:
