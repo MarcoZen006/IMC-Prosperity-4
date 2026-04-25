@@ -1,0 +1,104 @@
+import math
+from typing import Dict, List
+from datamodel import OrderDepth, UserId, TradingState, Order
+
+class Trader:
+    def __init__(self):
+        # State tracking for stochastic variables
+        self.past_microprices = {}
+        self.volatility_ema = {}
+        
+        # Quantitative parameters
+        self.alpha_vol = 0.1  # Decay factor for volatility EMA
+        self.risk_aversion = 0.05 # Gamma factor for inventory penalty
+        self.base_spread = 2.0 # Minimum half-spread
+
+    def calculate_microprice(self, order_depth: OrderDepth) -> float:
+        if not order_depth.sell_orders or not order_depth.buy_orders:
+            return 0.0
+            
+        best_ask = min(order_depth.sell_orders.keys())
+        best_bid = max(order_depth.buy_orders.keys())
+        ask_vol = abs(order_depth.sell_orders[best_ask])
+        bid_vol = abs(order_depth.buy_orders[best_bid])
+        
+        # Volume-weighted microprice
+        microprice = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+        return microprice
+
+    def update_volatility(self, product: str, current_microprice: float):
+        if product not in self.past_microprices:
+            self.past_microprices[product] = current_microprice
+            self.volatility_ema[product] = 1.0 # Initialize with non-zero variance
+            return self.volatility_ema[product]
+            
+        prev_microprice = self.past_microprices[product]
+        sq_return = (current_microprice - prev_microprice) ** 2
+        
+        # EWMA variance update
+        current_variance = self.volatility_ema.get(product, 1.0)
+        new_variance = self.alpha_vol * sq_return + (1 - self.alpha_vol) * current_variance
+        
+        self.volatility_ema[product] = new_variance
+        self.past_microprices[product] = current_microprice
+        
+        return new_variance
+
+    def run(self, state: TradingState) -> tuple[Dict[str, List[Order]], int, str]:
+        result = {}
+        conversions = 0
+        trader_data = ""
+
+        for product in state.order_depths:
+            order_depth: OrderDepth = state.order_depths[product]
+            orders: List[Order] = []
+            
+            # 1. Estimate VWM
+            microprice = self.calculate_microprice(order_depth)
+            if microprice == 0.0:
+                continue
+
+            # 2. Update Stochastic Volatility
+            variance = self.update_volatility(product, microprice)
+            
+            # 3. Assess Inventory
+            current_position = state.position.get(product, 0)
+            
+            # 4. Calculate Avellaneda-Stoikov Reservation Price
+            # Penalizes the price based on holding too much inventory in a volatile market
+            inventory_penalty = current_position * self.risk_aversion * variance
+            reservation_price = microprice - inventory_penalty
+            
+            # 5. Dynamic Quoting Spread
+            # Expands spread as variance increases to protect against adverse selection
+            dynamic_half_spread = self.base_spread + (0.5 * math.sqrt(variance))
+            
+            # Calculate optimal bid and ask levels
+            optimal_bid = math.floor(reservation_price - dynamic_half_spread)
+            optimal_ask = math.ceil(reservation_price + dynamic_half_spread)
+            
+            # 6. Order Generation
+            # Limit sizes safely without hardcoding product-specific caps
+            # We assume a standard safe sizing chunk that scales down if variance is too high
+            trade_size = max(1, int(10 / max(1.0, math.sqrt(variance))))
+            
+            # Execute Market Making quotes
+            orders.append(Order(product, optimal_bid, trade_size))
+            orders.append(Order(product, optimal_ask, -trade_size))
+            
+            # Sniping logic for crossing the spread if an order is extremely mispriced
+            if len(order_depth.sell_orders) > 0:
+                best_ask = min(order_depth.sell_orders.keys())
+                if best_ask < reservation_price - dynamic_half_spread:
+                    take_vol = min(abs(order_depth.sell_orders[best_ask]), trade_size)
+                    orders.append(Order(product, best_ask, take_vol))
+                    
+            if len(order_depth.buy_orders) > 0:
+                best_bid = max(order_depth.buy_orders.keys())
+                if best_bid > reservation_price + dynamic_half_spread:
+                    take_vol = min(abs(order_depth.buy_orders[best_bid]), trade_size)
+                    orders.append(Order(product, best_bid, -take_vol))
+
+            result[product] = orders
+
+        return result, conversions, trader_data
