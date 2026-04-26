@@ -1,20 +1,11 @@
-import math
 import json
-from typing import Dict, List, Tuple, Optional
+import math
+from typing import Dict, List, Optional, Tuple
+
 from datamodel import OrderDepth, TradingState, Order
 
 
 class Trader:
-    """
-    Round 3 v5: stays very close to the best v3 / original microprice bot.
-
-    Extra optimisation versus v4:
-    - tiny momentum lean, capped hard so it cannot dominate
-    - endgame risk lock after ~86% of the day
-    - final-phase inventory reduction after ~94% of the day
-    - avoids adding inventory in the wrong direction near the end
-    """
-
     POSITION_LIMITS = {
         "HYDROGEL_PACK": 200,
         "VELVETFRUIT_EXTRACT": 200,
@@ -30,252 +21,733 @@ class Trader:
         "VEV_6500": 300,
     }
 
-    PARAMS = {
-        "HYDROGEL_PACK": {"alpha": 0.10, "risk": 0.050, "spread": 2.0, "vol_mult": 0.50, "size": 11, "edge": 0.00, "imb": 0.25},
-        "VELVETFRUIT_EXTRACT": {"alpha": 0.10, "risk": 0.050, "spread": 2.0, "vol_mult": 0.50, "size": 11, "edge": 0.00, "imb": 0.30},
-        "VEV_4000": {"alpha": 0.10, "risk": 0.045, "spread": 2.0, "vol_mult": 0.50, "size": 10, "edge": 0.00, "imb": 0.15},
-        "VEV_4500": {"alpha": 0.10, "risk": 0.045, "spread": 2.0, "vol_mult": 0.50, "size": 10, "edge": 0.00, "imb": 0.15},
-        "VEV_5000": {"alpha": 0.10, "risk": 0.050, "spread": 2.0, "vol_mult": 0.50, "size": 10, "edge": 0.00, "imb": 0.20},
-        "VEV_5100": {"alpha": 0.10, "risk": 0.050, "spread": 2.0, "vol_mult": 0.50, "size": 10, "edge": 0.00, "imb": 0.20},
-        "VEV_5200": {"alpha": 0.10, "risk": 0.055, "spread": 2.1, "vol_mult": 0.52, "size": 9, "edge": 0.00, "imb": 0.20},
-        "VEV_5300": {"alpha": 0.10, "risk": 0.055, "spread": 2.1, "vol_mult": 0.52, "size": 9, "edge": 0.00, "imb": 0.20},
-        "VEV_5400": {"alpha": 0.10, "risk": 0.060, "spread": 2.2, "vol_mult": 0.55, "size": 8, "edge": 0.00, "imb": 0.15},
-        "VEV_5500": {"alpha": 0.10, "risk": 0.060, "spread": 2.2, "vol_mult": 0.55, "size": 8, "edge": 0.00, "imb": 0.15},
-        "VEV_6000": {"alpha": 0.10, "risk": 0.040, "spread": 1.8, "vol_mult": 0.45, "size": 6, "edge": 0.00, "imb": 0.05},
-        "VEV_6500": {"alpha": 0.10, "risk": 0.040, "spread": 1.8, "vol_mult": 0.45, "size": 6, "edge": 0.00, "imb": 0.05},
+    VOUCHER_STRIKES = {
+        "VEV_4000": 4000,
+        "VEV_4500": 4500,
+        "VEV_5000": 5000,
+        "VEV_5100": 5100,
+        "VEV_5200": 5200,
+        "VEV_5300": 5300,
+        "VEV_5400": 5400,
+        "VEV_5500": 5500,
+        "VEV_6000": 6000,
+        "VEV_6500": 6500,
+    }
+
+    # Near-the-money vouchers caused the large local backtester drawdown. Their
+    # value depends heavily on the fitted vol curve, which is not stable enough
+    # across local public data and IMC submission data. Keep them in the curve
+    # fit, but only trade vouchers with a large intrinsic cushion.
+    MIN_VOUCHER_INTRINSIC_CUSHION = 250.0
+    MIN_INTRINSIC_PRICE_RATIO = 0.75
+
+    GLOBAL_PARAMS = {
+        "alpha_vol": 0.10,
+        "risk_aversion": 0.050,
+        "base_spread": 2.0,
+        "size": 10,
+        "take_mult": 1.00,
+        "max_var": 500.0,
+    }
+
+    PRODUCT_PARAMS = {
+        "HYDROGEL_PACK": {
+            "alpha_vol": 0.08,
+            "risk_aversion": 0.035,
+            "base_spread": 1.8,
+            "size": 18,
+            "take_mult": 1.00,
+            "max_var": 400.0,
+        },
+        "VELVETFRUIT_EXTRACT": {
+            "alpha_vol": 0.08,
+            "risk_aversion": 0.030,
+            "base_spread": 1.8,
+            "size": 16,
+            "take_mult": 1.00,
+            "max_var": 500.0,
+        },
+        "DEFAULT_VOUCHER": {
+            "alpha_vol": 0.12,
+            "risk_aversion": 0.045,
+            "base_spread": 1.2,
+            "size": 12,
+            "take_mult": 1.10,
+            "max_var": 200.0,
+        },
     }
 
     def __init__(self):
         self.past_microprices: Dict[str, float] = {}
         self.volatility_ema: Dict[str, float] = {}
-        self.mid_ema: Dict[str, float] = {}
-        self.last_micro_diff: Dict[str, float] = {}
+        self.slope_ema: Dict[str, float] = {}
+        self.total_vol_ema: float = 0.035
 
-    def load_state(self, trader_data: str) -> None:
+    def load_memory(self, trader_data: str) -> None:
         if not trader_data:
             return
         try:
             data = json.loads(trader_data)
-            self.past_microprices.update({k: float(v) for k, v in data.get("past", {}).items()})
-            self.volatility_ema.update({k: float(v) for k, v in data.get("var", {}).items()})
-            self.mid_ema.update({k: float(v) for k, v in data.get("ema", {}).items()})
-            self.last_micro_diff.update({k: float(v) for k, v in data.get("diff", {}).items()})
+            self.past_microprices = data.get("past_microprices", {})
+            self.volatility_ema = data.get("volatility_ema", {})
+            self.slope_ema = data.get("slope_ema", {})
+            self.total_vol_ema = float(data.get("total_vol_ema", self.total_vol_ema))
         except Exception:
-            pass
+            self.past_microprices = {}
+            self.volatility_ema = {}
+            self.slope_ema = {}
+            self.total_vol_ema = 0.035
 
-    def save_state(self) -> str:
+    def save_memory(self) -> str:
         try:
             return json.dumps({
-                "past": self.past_microprices,
-                "var": self.volatility_ema,
-                "ema": self.mid_ema,
-                "diff": self.last_micro_diff,
+                "past_microprices": self.past_microprices,
+                "volatility_ema": self.volatility_ema,
+                "slope_ema": self.slope_ema,
+                "total_vol_ema": self.total_vol_ema,
             })
         except Exception:
             return ""
+
+    def params_for(self, product: str) -> Dict[str, float]:
+        if product in self.PRODUCT_PARAMS:
+            product_params = self.PRODUCT_PARAMS[product]
+        elif product.startswith("VEV_"):
+            product_params = self.PRODUCT_PARAMS["DEFAULT_VOUCHER"]
+        else:
+            product_params = self.GLOBAL_PARAMS
+
+        blend = 0.55
+        params: Dict[str, float] = {}
+        for key, global_value in self.GLOBAL_PARAMS.items():
+            product_value = product_params.get(key, global_value)
+            params[key] = (1.0 - blend) * float(global_value) + blend * float(product_value)
+        return params
+
+    @staticmethod
+    def normal_cdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    @classmethod
+    def black_scholes_call(cls, spot: float, strike: float, total_vol: float) -> float:
+        if spot <= 0.0 or strike <= 0.0:
+            return 0.0
+        if total_vol <= 1e-9:
+            return max(0.0, spot - strike)
+
+        d1 = (math.log(spot / strike) + 0.5 * total_vol * total_vol) / total_vol
+        d2 = d1 - total_vol
+        price = spot * cls.normal_cdf(d1) - strike * cls.normal_cdf(d2)
+        return max(0.0, price)
+
+    @classmethod
+    def black_scholes_delta(cls, spot: float, strike: float, total_vol: float) -> float:
+        if spot <= 0.0 or strike <= 0.0:
+            return 0.0
+        if total_vol <= 1e-9:
+            return 1.0 if spot > strike else 0.0
+
+        d1 = (math.log(spot / strike) + 0.5 * total_vol * total_vol) / total_vol
+        return cls.normal_cdf(d1)
 
     def best_bid_ask(self, order_depth: OrderDepth) -> Tuple[Optional[int], Optional[int]]:
         best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
         best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
         return best_bid, best_ask
 
+    def top_mid(self, order_depth: OrderDepth) -> Optional[float]:
+        best_bid, best_ask = self.best_bid_ask(order_depth)
+        if best_bid is None or best_ask is None:
+            return None
+        return 0.5 * (best_bid + best_ask)
+
     def calculate_microprice(self, order_depth: OrderDepth) -> Optional[float]:
         best_bid, best_ask = self.best_bid_ask(order_depth)
         if best_bid is None or best_ask is None:
             return None
 
-        ask_vol = abs(order_depth.sell_orders[best_ask])
-        bid_vol = abs(order_depth.buy_orders[best_bid])
-        total = bid_vol + ask_vol
-        if total <= 0:
-            return (best_bid + best_ask) / 2.0
-
-        return (best_bid * ask_vol + best_ask * bid_vol) / total
-
-    def mid_price(self, order_depth: OrderDepth) -> Optional[float]:
-        best_bid, best_ask = self.best_bid_ask(order_depth)
-        if best_bid is None or best_ask is None:
-            return None
-        return (best_bid + best_ask) / 2.0
-
-    def imbalance(self, order_depth: OrderDepth) -> float:
-        best_bid, best_ask = self.best_bid_ask(order_depth)
-        if best_bid is None or best_ask is None:
-            return 0.0
-        bid_vol = abs(order_depth.buy_orders[best_bid])
-        ask_vol = abs(order_depth.sell_orders[best_ask])
-        if bid_vol + ask_vol == 0:
-            return 0.0
-        raw = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-        return math.tanh(1.5 * raw)
-
-    def update_mid_ema(self, product: str, mid: float) -> float:
-        if product not in self.mid_ema:
-            self.mid_ema[product] = mid
+        best_bid_vol = abs(order_depth.buy_orders[best_bid])
+        best_ask_vol = abs(order_depth.sell_orders[best_ask])
+        top_total = best_bid_vol + best_ask_vol
+        if top_total == 0:
+            top_micro = (best_bid + best_ask) / 2.0
         else:
-            self.mid_ema[product] = 0.04 * mid + 0.96 * self.mid_ema[product]
-        return self.mid_ema[product]
+            top_micro = (best_bid * best_ask_vol + best_ask * best_bid_vol) / top_total
 
-    def update_volatility(self, product: str, current_microprice: float) -> float:
-        p = self.PARAMS.get(product, self.PARAMS["HYDROGEL_PACK"])
-        alpha = p["alpha"]
+        bid_levels = [
+            (price, abs(volume))
+            for price, volume in sorted(order_depth.buy_orders.items(), reverse=True)[:3]
+            if volume > 0
+        ]
+        ask_levels = [
+            (price, abs(volume))
+            for price, volume in sorted(order_depth.sell_orders.items())[:3]
+            if volume < 0
+        ]
 
+        bid_qty = sum(volume for _, volume in bid_levels)
+        ask_qty = sum(volume for _, volume in ask_levels)
+        if bid_qty == 0 or ask_qty == 0:
+            return top_micro
+
+        bid_vwap = sum(price * volume for price, volume in bid_levels) / bid_qty
+        ask_vwap = sum(price * volume for price, volume in ask_levels) / ask_qty
+        depth_micro = (bid_vwap * ask_qty + ask_vwap * bid_qty) / (bid_qty + ask_qty)
+
+        return 0.70 * top_micro + 0.30 * depth_micro
+
+    def update_signals(self, product: str, microprice: float, alpha: float, max_var: float) -> Tuple[float, float]:
         if product not in self.past_microprices:
-            self.past_microprices[product] = current_microprice
+            self.past_microprices[product] = microprice
             self.volatility_ema[product] = 1.0
-            self.last_micro_diff[product] = 0.0
-            return 1.0
+            self.slope_ema[product] = 0.0
+            return 1.0, 0.0
 
-        prev_microprice = self.past_microprices[product]
-        diff = current_microprice - prev_microprice
-        self.last_micro_diff[product] = 0.20 * diff + 0.80 * self.last_micro_diff.get(product, 0.0)
-        sq_return = diff * diff
+        previous = self.past_microprices[product]
+        change = microprice - previous
+        sq_change = change * change
 
-        current_variance = self.volatility_ema.get(product, 1.0)
-        new_variance = alpha * sq_return + (1.0 - alpha) * current_variance
-        new_variance = max(0.25, min(new_variance, 10000.0))
+        old_var = self.volatility_ema.get(product, 1.0)
+        variance = alpha * sq_change + (1.0 - alpha) * old_var
+        variance = min(max_var, max(0.25, variance))
 
-        self.volatility_ema[product] = new_variance
-        self.past_microprices[product] = current_microprice
-        return new_variance
+        old_slope = self.slope_ema.get(product, 0.0)
+        slope = 0.20 * change + 0.80 * old_slope
 
-    def position(self, state: TradingState, product: str) -> int:
-        return state.position.get(product, 0)
+        self.past_microprices[product] = microprice
+        self.volatility_ema[product] = variance
+        self.slope_ema[product] = slope
+        return variance, slope
 
     def buy_capacity(self, state: TradingState, product: str) -> int:
-        return self.POSITION_LIMITS.get(product, 0) - self.position(state, product)
+        limit = self.POSITION_LIMITS[product]
+        return max(0, limit - state.position.get(product, 0))
 
     def sell_capacity(self, state: TradingState, product: str) -> int:
-        return self.POSITION_LIMITS.get(product, 0) + self.position(state, product)
-
-    def add_order(self, state: TradingState, orders: List[Order], product: str, price: int, quantity: int) -> None:
-        if quantity == 0 or price < 0:
-            return
-
-        if quantity > 0:
-            quantity = min(quantity, self.buy_capacity(state, product))
-        else:
-            quantity = -min(-quantity, self.sell_capacity(state, product))
-
-        if quantity != 0:
-            orders.append(Order(product, price, quantity))
-
-    def dynamic_size(self, product: str, variance: float, position: int) -> int:
-        p = self.PARAMS.get(product, self.PARAMS["HYDROGEL_PACK"])
-        vol = math.sqrt(max(variance, 1.0))
-        raw_size = int(p["size"] / max(1.0, vol / 1.4))
-
         limit = self.POSITION_LIMITS[product]
-        inv_ratio = abs(position) / limit
-        inv_scale = 1.0 - min(0.65, inv_ratio)
+        return max(0, limit + state.position.get(product, 0))
 
-        return max(1, int(raw_size * inv_scale))
+    def add_passive_quotes(
+        self,
+        product: str,
+        orders: List[Order],
+        bid_price: int,
+        ask_price: int,
+        buy_qty: int,
+        sell_qty: int,
+    ) -> None:
+        if bid_price >= 0 and buy_qty > 0:
+            orders.append(Order(product, bid_price, buy_qty))
+        if ask_price >= 0 and sell_qty > 0:
+            orders.append(Order(product, ask_price, -sell_qty))
 
-    def time_fraction(self, timestamp: int) -> float:
-        if timestamp <= 100000:
-            return max(0.0, min(1.0, timestamp / 100000.0))
-        return max(0.0, min(1.0, timestamp / 1000000.0))
+    def order_book_imbalance(self, order_depth: OrderDepth) -> float:
+        bid_levels = [
+            abs(volume)
+            for _, volume in sorted(order_depth.buy_orders.items(), reverse=True)[:3]
+            if volume > 0
+        ]
+        ask_levels = [
+            abs(volume)
+            for _, volume in sorted(order_depth.sell_orders.items())[:3]
+            if volume < 0
+        ]
+        bid_total = sum(bid_levels)
+        ask_total = sum(ask_levels)
+        denom = bid_total + ask_total
+        if denom == 0:
+            return 0.0
+        return (bid_total - ask_total) / denom
 
-    def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
-        self.load_state(state.traderData)
+    def estimate_total_vol(
+        self,
+        spot: float,
+        voucher_mids: Dict[str, float],
+        voucher_spreads: Dict[str, float],
+        exclude_product: Optional[str] = None,
+    ) -> Optional[float]:
+        observations: List[Tuple[str, float, float, float]] = []
+
+        for product, strike in self.VOUCHER_STRIKES.items():
+            if product == exclude_product:
+                continue
+            mid = voucher_mids.get(product)
+            if mid is None:
+                continue
+
+            spread = max(1.0, voucher_spreads.get(product, 1.0))
+
+            # Deep floor vouchers carry almost no information about volatility when
+            # their displayed market is just 0/1. Keep them tradable, but do not let
+            # them drag the whole curve fit.
+            if mid <= 0.75 and strike > spot + 300.0:
+                continue
+
+            weight = 1.0 / ((1.0 + spread) ** 2)
+
+            # Very deep ITM vouchers are mostly intrinsic value. They help anchor
+            # parity, but they should not dominate the volatility fit.
+            if spot - strike > 700.0:
+                weight *= 0.35
+
+            observations.append((product, float(strike), float(mid), weight))
+
+        if len(observations) < 3:
+            return None
+
+        best_w = self.total_vol_ema
+        best_error = float("inf")
+
+        # Wide, model-based grid over total volatility sigma*sqrt(T).
+        # This is not calibrated to a specific day; it is re-estimated live from the
+        # current option chain every timestamp.
+        for i in range(60):
+            w = 0.005 + i * (0.220 - 0.005) / 59.0
+            total_error = 0.0
+            total_weight = 0.0
+
+            for _, strike, mid, weight in observations:
+                model = self.black_scholes_call(spot, strike, w)
+                spread = max(1.0, voucher_spreads.get(_, 1.0))
+                scaled_error = (model - mid) / spread
+
+                # Huber-style cap prevents one stale or crossed product from moving
+                # the whole option curve.
+                scaled_error = max(-5.0, min(5.0, scaled_error))
+                total_error += weight * scaled_error * scaled_error
+                total_weight += weight
+
+            if total_weight > 0.0:
+                total_error /= total_weight
+
+            if total_error < best_error:
+                best_error = total_error
+                best_w = w
+
+        return best_w
+
+    def collect_voucher_books(
+        self,
+        state: TradingState,
+    ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Tuple[int, int]]]:
+        mids: Dict[str, float] = {}
+        spreads: Dict[str, float] = {}
+        bests: Dict[str, Tuple[int, int]] = {}
+
+        for product in self.VOUCHER_STRIKES:
+            order_depth = state.order_depths.get(product)
+            if order_depth is None:
+                continue
+            best_bid, best_ask = self.best_bid_ask(order_depth)
+            if best_bid is None or best_ask is None:
+                continue
+            mids[product] = 0.5 * (best_bid + best_ask)
+            spreads[product] = max(1.0, float(best_ask - best_bid))
+            bests[product] = (best_bid, best_ask)
+
+        return mids, spreads, bests
+
+    def trade_voucher_with_option_curve(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        state: TradingState,
+        spot: float,
+        voucher_mids: Dict[str, float],
+        voucher_spreads: Dict[str, float],
+    ) -> List[Order]:
+        orders: List[Order] = []
+        strike = self.VOUCHER_STRIKES[product]
+        best_bid, best_ask = self.best_bid_ask(order_depth)
+        if best_bid is None or best_ask is None:
+            return orders
+
+        spread = max(1.0, float(best_ask - best_bid))
+        position = state.position.get(product, 0)
+        limit = self.POSITION_LIMITS[product]
+        buy_cap = self.buy_capacity(state, product)
+        sell_cap = self.sell_capacity(state, product)
+        market_mid = 0.5 * (best_bid + best_ask)
+        intrinsic = max(0.0, spot - strike)
+
+        if not self.should_trade_voucher(product, spot, intrinsic, market_mid):
+            return self.reduce_voucher_inventory(product, order_depth, state)
+
+        raw_w = self.estimate_total_vol(
+            spot,
+            voucher_mids,
+            voucher_spreads,
+            exclude_product=product,
+        )
+        total_vol = self.total_vol_ema if raw_w is None else 0.50 * self.total_vol_ema + 0.50 * raw_w
+
+        model_fair = self.black_scholes_call(spot, strike, total_vol)
+
+        # No-arbitrage floor: a call should not be priced below intrinsic value.
+        # For far OTM vouchers, do not force a 0/1 tick-floor value into the model;
+        # only trade them when the fair value genuinely supports it.
+        fair = max(model_fair, intrinsic)
+
+        delta = self.black_scholes_delta(spot, strike, total_vol)
+        inv_frac = position / limit if limit > 0 else 0.0
+
+        # Inventory-adjusted fair: if long, become more willing to sell; if short,
+        # become more willing to buy. Delta makes ITM vouchers receive stronger
+        # inventory pressure than tiny far-OTM vouchers.
+        inventory_shift = inv_frac * max(1.0, 0.45 * spread) * (1.0 + 2.0 * delta)
+        fair_adj = fair - inventory_shift
+
+        top_depth = 0
+        if best_bid in order_depth.buy_orders:
+            top_depth += abs(order_depth.buy_orders[best_bid])
+        if best_ask in order_depth.sell_orders:
+            top_depth += abs(order_depth.sell_orders[best_ask])
+        base_size = max(1, min(18, top_depth // 3 if top_depth > 0 else 4))
+
+        # Larger edge gets more size, but never jumps to the position limit in one tick.
+        min_take_edge = max(1.0, 0.55 * spread, 0.006 * max(20.0, fair))
+        bought = 0
+        sold = 0
+
+        if buy_cap > 0:
+            for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
+                if ask_volume >= 0:
+                    continue
+                edge = fair_adj - ask_price
+                if edge <= min_take_edge:
+                    break
+                edge_scale = 1 + int(min(2.0, edge / max(1.0, min_take_edge)))
+                qty = min(abs(ask_volume), buy_cap - bought, base_size * edge_scale)
+                if qty <= 0:
+                    break
+                orders.append(Order(product, ask_price, qty))
+                bought += qty
+                if bought >= buy_cap or bought >= 3 * base_size:
+                    break
+
+        if sell_cap > 0:
+            for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
+                if bid_volume <= 0:
+                    continue
+                edge = bid_price - fair_adj
+                if edge <= min_take_edge:
+                    break
+                edge_scale = 1 + int(min(2.0, edge / max(1.0, min_take_edge)))
+                qty = min(abs(bid_volume), sell_cap - sold, base_size * edge_scale)
+                if qty <= 0:
+                    break
+                orders.append(Order(product, bid_price, -qty))
+                sold += qty
+                if sold >= sell_cap or sold >= 3 * base_size:
+                    break
+
+        remaining_buy = max(0, buy_cap - bought)
+        remaining_sell = max(0, sell_cap - sold)
+
+        quote_edge = max(1.0, 0.35 * spread)
+        bid_quote = min(best_bid + 1, math.floor(fair_adj - quote_edge))
+        ask_quote = max(best_ask - 1, math.ceil(fair_adj + quote_edge))
+
+        if bid_quote >= ask_quote:
+            mid_quote = int(round(fair_adj))
+            bid_quote = mid_quote - 1
+            ask_quote = mid_quote + 1
+
+        # Never cross the visible market with passive quotes.
+        if bid_quote >= best_ask:
+            bid_quote = best_ask - 1
+        if ask_quote <= best_bid:
+            ask_quote = best_bid + 1
+
+        quote_buy = min(base_size, remaining_buy)
+        quote_sell = min(base_size, remaining_sell)
+
+        # Do not keep adding to stretched inventory. Keep quoting the side that
+        # reduces risk.
+        if position > 0.55 * limit:
+            quote_buy = 0
+            quote_sell = min(remaining_sell, max(quote_sell, base_size))
+        elif position < -0.55 * limit:
+            quote_sell = 0
+            quote_buy = min(remaining_buy, max(quote_buy, base_size))
+
+        # Only quote a side when the model says that side is not obviously bad.
+        if fair_adj < best_bid + 0.20 * spread:
+            quote_buy = 0
+        if fair_adj > best_ask - 0.20 * spread:
+            quote_sell = 0
+
+        self.add_passive_quotes(
+            product,
+            orders,
+            bid_quote,
+            ask_quote,
+            quote_buy,
+            quote_sell,
+        )
+
+        return orders
+
+    def should_trade_voucher(
+        self,
+        product: str,
+        spot: float,
+        intrinsic: float,
+        market_mid: float,
+    ) -> bool:
+        if product not in self.VOUCHER_STRIKES:
+            return False
+
+        if intrinsic < self.MIN_VOUCHER_INTRINSIC_CUSHION:
+            return False
+
+        # Avoid buying optionality priced mostly by the fitted vol curve. The
+        # backtester loss came from VEV_5200/VEV_5300 where this ratio was small.
+        if market_mid < self.MIN_INTRINSIC_PRICE_RATIO * intrinsic:
+            return False
+
+        return True
+
+    def reduce_voucher_inventory(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        state: TradingState,
+    ) -> List[Order]:
+        orders: List[Order] = []
+        position = state.position.get(product, 0)
+        if position == 0:
+            return orders
+
+        best_bid, best_ask = self.best_bid_ask(order_depth)
+        if position > 0 and best_bid is not None:
+            qty = min(position, abs(order_depth.buy_orders.get(best_bid, 0)))
+            if qty > 0:
+                orders.append(Order(product, best_bid, -qty))
+        elif position < 0 and best_ask is not None:
+            qty = min(-position, abs(order_depth.sell_orders.get(best_ask, 0)))
+            if qty > 0:
+                orders.append(Order(product, best_ask, qty))
+
+        return orders
+
+    def trade_generic_market_maker(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        state: TradingState,
+        extra_inventory: float = 0.0,
+    ) -> List[Order]:
+        orders: List[Order] = []
+
+        params = self.params_for(product)
+        microprice = self.calculate_microprice(order_depth)
+        if microprice is None:
+            return orders
+
+        variance, slope = self.update_signals(
+            product,
+            microprice,
+            alpha=float(params["alpha_vol"]),
+            max_var=float(params["max_var"]),
+        )
+
+        raw_position = state.position.get(product, 0)
+        limit = self.POSITION_LIMITS[product]
+        effective_position = raw_position + extra_inventory
+        buy_cap = self.buy_capacity(state, product)
+        sell_cap = self.sell_capacity(state, product)
+
+        vol = math.sqrt(variance)
+        inv_frac = abs(effective_position) / limit if limit > 0 else 0.0
+
+        generic_reservation = microprice - effective_position * self.GLOBAL_PARAMS["risk_aversion"] * variance
+        product_reservation = microprice - effective_position * float(params["risk_aversion"]) * variance
+        reservation_price = 0.45 * generic_reservation + 0.55 * product_reservation
+
+        trend_edge = max(-1.5 * vol, min(1.5 * vol, slope))
+        reservation_price += 0.15 * trend_edge
+
+        if effective_position > 0:
+            reservation_price -= inv_frac * (0.35 + 0.15 * vol)
+        elif effective_position < 0:
+            reservation_price += inv_frac * (0.35 + 0.15 * vol)
+
+        if inv_frac > 0.60:
+            convex = ((inv_frac - 0.60) / 0.40) ** 2
+            if effective_position > 0:
+                reservation_price -= convex * (0.60 + 0.25 * vol)
+            elif effective_position < 0:
+                reservation_price += convex * (0.60 + 0.25 * vol)
+
+        generic_half_spread = self.GLOBAL_PARAMS["base_spread"] + 0.50 * vol
+        product_half_spread = float(params["base_spread"]) + 0.45 * vol
+        half_spread = max(1.0, 0.45 * generic_half_spread + 0.55 * product_half_spread)
+        half_spread += 0.35 * inv_frac
+        if inv_frac > 0.60:
+            half_spread += 0.80 * ((inv_frac - 0.60) / 0.40) ** 2
+
+        bid_price = math.floor(reservation_price - half_spread)
+        ask_price = math.ceil(reservation_price + half_spread)
+        if bid_price >= ask_price:
+            bid_price = ask_price - 1
+
+        best_bid, best_ask = self.best_bid_ask(order_depth)
+        top_bid_vol = abs(order_depth.buy_orders[best_bid]) if best_bid is not None else 0
+        top_ask_vol = abs(order_depth.sell_orders[best_ask]) if best_ask is not None else 0
+        visible_depth = max(1, (top_bid_vol + top_ask_vol) // 2)
+
+        generic_size = int(self.GLOBAL_PARAMS["size"] / max(1.0, vol))
+        product_size = int(float(params["size"]) / max(1.0, vol / 2.0))
+        raw_size = max(1, int(0.45 * generic_size + 0.55 * product_size))
+        trade_size = max(1, min(raw_size, max(1, visible_depth // 2)))
+
+        bought = 0
+        sold = 0
+        take_edge = half_spread * float(params["take_mult"])
+        imbalance = self.order_book_imbalance(order_depth)
+
+        buy_take_confirmed = slope >= 0.0 and imbalance >= 0.0
+        sell_take_confirmed = slope <= 0.0 and imbalance <= 0.0
+        max_take_qty = max(1, 2 * trade_size)
+
+        if buy_cap > 0:
+            remaining_buy_take = min(buy_cap, max_take_qty)
+            for ask_price_level, ask_volume_level in sorted(order_depth.sell_orders.items()):
+                if ask_volume_level >= 0:
+                    continue
+                edge = reservation_price - ask_price_level
+                if edge <= take_edge:
+                    break
+                strong_edge = edge >= 1.50 * take_edge
+                if not (buy_take_confirmed or strong_edge):
+                    break
+                qty = min(abs(ask_volume_level), remaining_buy_take)
+                if qty <= 0:
+                    continue
+                orders.append(Order(product, ask_price_level, qty))
+                bought += qty
+                remaining_buy_take -= qty
+                if remaining_buy_take <= 0:
+                    break
+
+        if sell_cap > 0:
+            remaining_sell_take = min(sell_cap, max_take_qty)
+            for bid_price_level, bid_volume_level in sorted(order_depth.buy_orders.items(), reverse=True):
+                if bid_volume_level <= 0:
+                    continue
+                edge = bid_price_level - reservation_price
+                if edge <= take_edge:
+                    break
+                strong_edge = edge >= 1.50 * take_edge
+                if not (sell_take_confirmed or strong_edge):
+                    break
+                qty = min(abs(bid_volume_level), remaining_sell_take)
+                if qty <= 0:
+                    continue
+                orders.append(Order(product, bid_price_level, -qty))
+                sold += qty
+                remaining_sell_take -= qty
+                if remaining_sell_take <= 0:
+                    break
+
+        remaining_buy = max(0, buy_cap - bought)
+        remaining_sell = max(0, sell_cap - sold)
+
+        quote_buy_size = min(trade_size, remaining_buy)
+        quote_sell_size = min(trade_size, remaining_sell)
+
+        raw_inv_frac = abs(raw_position) / limit if limit > 0 else 0.0
+        if raw_inv_frac > 0.50:
+            if raw_position > 0:
+                quote_buy_size = max(0, quote_buy_size // 2)
+                quote_sell_size = min(remaining_sell, max(quote_sell_size, trade_size))
+            elif raw_position < 0:
+                quote_sell_size = max(0, quote_sell_size // 2)
+                quote_buy_size = min(remaining_buy, max(quote_buy_size, trade_size))
+
+        self.add_passive_quotes(
+            product,
+            orders,
+            bid_price,
+            ask_price,
+            quote_buy_size,
+            quote_sell_size,
+        )
+
+        return orders
+
+    def current_option_delta_inventory(self, state: TradingState, spot: float, total_vol: float) -> float:
+        delta_inventory = 0.0
+        for product, strike in self.VOUCHER_STRIKES.items():
+            position = state.position.get(product, 0)
+            if position == 0:
+                continue
+            delta = self.black_scholes_delta(spot, strike, total_vol)
+            delta_inventory += position * delta
+        return delta_inventory
+
+    def run(self, state: TradingState) -> tuple[Dict[str, List[Order]], int, str]:
+        self.load_memory(state.traderData)
 
         result: Dict[str, List[Order]] = {}
         conversions = 0
-        day_frac = self.time_fraction(state.timestamp)
-        endgame = day_frac > 0.84
-        profit_lock = day_frac > 0.90
-        final_phase = day_frac > 0.92
 
-        for product in state.order_depths:
+        spot: Optional[float] = None
+        underlying_depth = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if underlying_depth is not None:
+            spot = self.calculate_microprice(underlying_depth)
+
+        voucher_mids, voucher_spreads, _ = self.collect_voucher_books(state)
+
+        if spot is not None and len(voucher_mids) >= 3:
+            raw_total_vol = self.estimate_total_vol(
+                spot,
+                voucher_mids,
+                voucher_spreads,
+                exclude_product=None,
+            )
+            if raw_total_vol is not None:
+                self.total_vol_ema = 0.85 * self.total_vol_ema + 0.15 * raw_total_vol
+                self.total_vol_ema = max(0.005, min(0.220, self.total_vol_ema))
+
+        option_delta_inventory = 0.0
+        if spot is not None:
+            option_delta_inventory = self.current_option_delta_inventory(
+                state,
+                spot,
+                self.total_vol_ema,
+            )
+
+        for product, order_depth in state.order_depths.items():
             if product not in self.POSITION_LIMITS:
+                result[product] = []
                 continue
 
-            order_depth: OrderDepth = state.order_depths[product]
-            orders: List[Order] = []
+            if product in self.VOUCHER_STRIKES and spot is not None and len(voucher_mids) >= 3:
+                result[product] = self.trade_voucher_with_option_curve(
+                    product,
+                    order_depth,
+                    state,
+                    spot,
+                    voucher_mids,
+                    voucher_spreads,
+                )
+            elif product == "VELVETFRUIT_EXTRACT":
+                # Use the underlying as the hedge/anchor for the voucher book.
+                # The delta term is soft: it shifts quotes without forcing expensive
+                # hedge trades through the spread.
+                result[product] = self.trade_generic_market_maker(
+                    product,
+                    order_depth,
+                    state,
+                    extra_inventory=0.20 * option_delta_inventory,
+                )
+            else:
+                result[product] = self.trade_generic_market_maker(
+                    product,
+                    order_depth,
+                    state,
+                )
 
-            microprice = self.calculate_microprice(order_depth)
-            mid = self.mid_price(order_depth)
-            if microprice is None or mid is None:
-                result[product] = orders
-                continue
-
-            params = self.PARAMS.get(product, self.PARAMS["HYDROGEL_PACK"])
-            variance = self.update_volatility(product, microprice)
-            vol = math.sqrt(max(variance, 0.25))
-
-            current_position = self.position(state, product)
-            limit = self.POSITION_LIMITS[product]
-            inv_ratio = current_position / limit
-
-            ema = self.update_mid_ema(product, mid)
-            imb = self.imbalance(order_depth)
-            momentum = self.last_micro_diff.get(product, 0.0)
-            momentum_lean = max(-1.5, min(1.5, 0.12 * momentum))
-
-            fair_micro = 0.91 * microprice + 0.09 * ema + params["imb"] * imb + momentum_lean
-
-            risk_mult = 1.0
-            if endgame:
-                risk_mult = 1.35
-            if profit_lock:
-                risk_mult = 1.75
-            if final_phase:
-                risk_mult = 2.35
-
-            inventory_penalty = current_position * params["risk"] * variance * risk_mult
-            soft_limit_skew = math.tanh(2.0 * inv_ratio) * (1.0 + 0.15 * vol) * risk_mult
-            reservation_price = fair_micro - inventory_penalty - soft_limit_skew
-
-            dynamic_half_spread = params["spread"] + params["vol_mult"] * vol
-            if endgame:
-                dynamic_half_spread *= 1.12
-            if profit_lock:
-                dynamic_half_spread *= 1.22
-            if final_phase:
-                dynamic_half_spread *= 1.45
-            dynamic_half_spread = max(1.0, min(dynamic_half_spread, 24.0))
-
-            optimal_bid = math.floor(reservation_price - dynamic_half_spread)
-            optimal_ask = math.ceil(reservation_price + dynamic_half_spread)
-
-            trade_size = self.dynamic_size(product, variance, current_position)
-            if endgame:
-                trade_size = max(1, int(trade_size * 0.80))
-            if profit_lock:
-                trade_size = max(1, int(trade_size * 0.65))
-            if final_phase:
-                trade_size = max(1, int(trade_size * 0.45))
-
-            allow_buy_quote = inv_ratio < 0.85 and not (profit_lock and current_position > 0) and not (final_phase and current_position > -limit * 0.05)
-            allow_sell_quote = inv_ratio > -0.85 and not (profit_lock and current_position < 0) and not (final_phase and current_position < limit * 0.05)
-
-            if allow_buy_quote:
-                self.add_order(state, orders, product, optimal_bid, trade_size)
-            if allow_sell_quote:
-                self.add_order(state, orders, product, optimal_ask, -trade_size)
-
-            best_bid, best_ask = self.best_bid_ask(order_depth)
-            edge = params["edge"]
-
-            if best_ask is not None and best_ask < reservation_price - dynamic_half_spread - edge:
-                if not (profit_lock and current_position >= 0):
-                    take_vol = min(abs(order_depth.sell_orders[best_ask]), trade_size)
-                    self.add_order(state, orders, product, best_ask, take_vol)
-
-            if best_bid is not None and best_bid > reservation_price + dynamic_half_spread + edge:
-                if not (profit_lock and current_position <= 0):
-                    take_vol = min(abs(order_depth.buy_orders[best_bid]), trade_size)
-                    self.add_order(state, orders, product, best_bid, -take_vol)
-
-            if profit_lock and abs(current_position) > max(4, int(0.04 * limit)):
-                divisor = 2 if final_phase else 3
-                reduce_size = max(1, min(abs(current_position) // divisor, trade_size * 4))
-                if current_position > 0 and best_bid is not None:
-                    self.add_order(state, orders, product, best_bid, -reduce_size)
-                elif current_position < 0 and best_ask is not None:
-                    self.add_order(state, orders, product, best_ask, reduce_size)
-
-            result[product] = orders
-
-        trader_data = self.save_state()
-        return result, conversions, trader_data
+        return result, conversions, self.save_memory()
