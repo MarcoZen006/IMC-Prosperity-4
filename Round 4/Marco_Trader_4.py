@@ -88,7 +88,9 @@ class Trader:
     # This only changes HYDROGEL fair value; voucher logic and VELVET hedge
     # settings are left unchanged so this can be tested in isolation.
     HYDRO_MU = 9995.4
-    HYDRO_OU_PULL = 0.15
+    # Trader 25: drop from 0.15 -> 0.10 to test weaker mean-reversion pull
+    # (Trader 24 confirmed 0.20 is too strong, -200 PNL).
+    HYDRO_OU_PULL = 0.10
     ACF1 = {
         HYDROGEL: -0.124,
         VELVET: -0.160,
@@ -143,12 +145,15 @@ class Trader:
         "VEV_5500": -1.0,
     }
 
+    # Larger passive sizes from Trader 13.
+    # This keeps the same fair-value / quoting logic, but increases maker
+    # participation where the previous tests showed useful edge.
     BASE_PASSIVE_SIZE = {
-        HYDROGEL: 10,
-        VELVET: 8,           # smaller — VELVET is hedge-driven now
-        "VEV_4000": 10, "VEV_4500": 12, "VEV_5000": 18,
-        "VEV_5100": 18, "VEV_5200": 18, "VEV_5300": 16,
-        "VEV_5400": 12, "VEV_5500": 8,
+        HYDROGEL: 15,
+        VELVET: 8,           # VELVET remains hedge-driven
+        "VEV_4000": 10, "VEV_4500": 10, "VEV_5000": 18,
+        "VEV_5100": 20, "VEV_5200": 25, "VEV_5300": 25,
+        "VEV_5400": 20, "VEV_5500": 15,
     }
 
     MAX_TAKE_SIZE = {
