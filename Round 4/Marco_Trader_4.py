@@ -149,8 +149,13 @@ class Trader:
     # Larger passive sizes from Trader 13.
     # This keeps the same fair-value / quoting logic, but increases maker
     # participation where the previous tests showed useful edge.
+    # Trader 58: HYDROGEL passive size 15 -> 25.
+    # Vouchers saturate at current sizes (T41 showed +5 was -37). HYDROGEL
+    # has rich MR/OU/OBI fair-value signal and no clamp on size. More
+    # passive flow = more captured spread + more inventory cycling, with
+    # the 0.25 scaling floor still protecting at extreme inventory.
     BASE_PASSIVE_SIZE = {
-        HYDROGEL: 15,
+        HYDROGEL: 25,
         VELVET: 8,           # VELVET remains hedge-driven
         "VEV_4000": 10, "VEV_4500": 10, "VEV_5000": 18,
         "VEV_5100": 20, "VEV_5200": 25, "VEV_5300": 25,
@@ -175,7 +180,10 @@ class Trader:
     # T38:32104. Testing if VELVET hedge is purely a drag.
     VELVET_HEDGE_CAP = 0
 
-    HYDRO_INVENTORY_SKEW_MULT = 2.5
+    # Trader 42: drop HYDRO_INVENTORY_SKEW_MULT 2.5 -> 2.0.
+    # With OU mean-reversion + AR(1) reversal in HYDROGEL fair, holding
+    # inventory longer may let mean-reversion realize before we skew out.
+    HYDRO_INVENTORY_SKEW_MULT = 2.0
 
     # In last X ticks of session, no aggressive crossing on HYDROGEL.
     # Prevents the kind of late-day adverse selection that cost ~600 in
@@ -221,23 +229,10 @@ class Trader:
             if orders:
                 result[product] = orders
 
-        # 2) Now compute hedge target for VELVET against the resulting
-        #    voucher position (using working_pos which reflects new orders).
-        velvet_depth = state.order_depths.get(self.VELVET)
-        if velvet_depth is not None:
-            best_bid, _, best_ask, _ = self._best_quotes(velvet_depth)
-            if best_bid is not None and best_ask is not None:
-                target = self._velvet_hedge_target(
-                    working_pos, velvet_mid, T,
-                )
-                fair = self._fair_value(
-                    self.VELVET, velvet_depth, mids, data, velvet_mid, T,
-                )
-                orders = self._trade_velvet_hedge(
-                    velvet_depth, fair, working_pos, target,
-                )
-                if orders:
-                    result[self.VELVET] = orders
+        # 2) Trader 40: VELVET trading disabled entirely.
+        # Trader 39 with hedge cap = 0 already removed directional hedging,
+        # leaving only passive MM. This tests whether even that residual
+        # VELVET activity is a drag.
 
         return result, conversions, self._dump_data(data)
 
