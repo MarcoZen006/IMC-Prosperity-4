@@ -170,9 +170,10 @@ class Trader:
     # full hedging would be partial. Capping at +-80 keeps the hedge cost
     # bounded in trending sessions while still providing some directional
     # protection against a vol spike.
-    # Trader 38: drop hedge cap from 20 -> 10.
-    # T32:30001, T33:30246, T34:30576, T35:30922, T36:31303, T37:31700.
-    VELVET_HEDGE_CAP = 10
+    # Trader 39: drop hedge cap from 10 -> 0 (no hedging at all).
+    # T32:30001, T33:30246, T34:30576, T35:30922, T36:31303, T37:31700,
+    # T38:32104. Testing if VELVET hedge is purely a drag.
+    VELVET_HEDGE_CAP = 0
 
     HYDRO_INVENTORY_SKEW_MULT = 2.5
 
