@@ -84,6 +84,16 @@ class Trader:
         "default": 0.10,
     }
 
+    # HYDROGEL mean-reversion / short-term reversal model from Trader 13.
+    # This only changes HYDROGEL fair value; voucher logic and VELVET hedge
+    # settings are left unchanged so this can be tested in isolation.
+    HYDRO_MU = 9995.4
+    HYDRO_OU_PULL = 0.15
+    ACF1 = {
+        HYDROGEL: -0.124,
+        VELVET: -0.160,
+    }
+
     # Take edge (cross-the-spread threshold)
     TAKE_EDGE = {
         HYDROGEL: 4.0,
@@ -231,6 +241,7 @@ class Trader:
                 if isinstance(data, dict):
                     data.setdefault("ema", {})
                     data.setdefault("prev_mid", {})
+                    data.setdefault("last_mid", {})
                     data.setdefault("day_index", 0)
                     data.setdefault("last_timestamp", None)
                     return data
@@ -240,6 +251,7 @@ class Trader:
         return {
             "ema": {},
             "prev_mid": {},
+            "last_mid": {},
             "day_index": 0,
             "last_timestamp": None,
         }
@@ -273,7 +285,10 @@ class Trader:
                 ema = alpha * mid + (1.0 - alpha) * float(old_ema)
 
             data["ema"][product] = ema
-            data["prev_mid"][product] = mid
+            prev_mid = data.get("last_mid", {}).get(product)
+            if prev_mid is not None:
+                data["prev_mid"][product] = prev_mid
+            data.setdefault("last_mid", {})[product] = mid
 
         return mids
 
@@ -301,10 +316,16 @@ class Trader:
         ema = float(data.get("ema", {}).get(product, mid if mid is not None else 0.0))
         obi = self._order_book_imbalance(depth)
 
+        prev = data.get("prev_mid", {}).get(product)
+        acf_adj = 0.0
+        if prev is not None and mid is not None:
+            acf_adj = self.ACF1.get(product, 0.0) * (mid - float(prev))
+
         if product == self.VELVET:
-            return ema + 2.0 * obi
+            return ema + 2.0 * obi + acf_adj
         if product == self.HYDROGEL:
-            return ema + 3.0 * obi
+            ou_adj = self.HYDRO_OU_PULL * (self.HYDRO_MU - ema)
+            return ema + ou_adj + 3.0 * obi + acf_adj
 
         return ema + 2.0 * obi
 
