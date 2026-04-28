@@ -271,7 +271,7 @@ class Trader:
         mids: Dict[str, float] = {}
 
         for product, depth in state.order_depths.items():
-            mid = self._mid(depth)
+            mid = self._vwap_mid(depth)
             if mid is None:
                 continue
 
@@ -574,6 +574,27 @@ class Trader:
         if best_bid is None or best_ask is None:
             return None
         return 0.5 * (best_bid + best_ask)
+
+    def _vwap_mid(self, depth: OrderDepth) -> Optional[float]:
+        """
+        Volume-weighted midpoint using all visible bid and ask levels.
+
+        This replaces the simple best bid/ask midpoint in the EMA update.
+        It is still non-hardcoded: it only uses current order-book prices
+        and displayed volumes.
+        """
+        if not depth.buy_orders or not depth.sell_orders:
+            return self._mid(depth)
+
+        bid_denom = sum(abs(v) for v in depth.buy_orders.values())
+        ask_denom = sum(abs(v) for v in depth.sell_orders.values())
+        if bid_denom == 0 or ask_denom == 0:
+            return self._mid(depth)
+
+        bid_vwap = sum(price * abs(volume) for price, volume in depth.buy_orders.items()) / bid_denom
+        ask_vwap = sum(price * abs(volume) for price, volume in depth.sell_orders.items()) / ask_denom
+
+        return 0.5 * (bid_vwap + ask_vwap)
 
     def _order_book_imbalance(self, depth: OrderDepth) -> float:
         bid_vol = sum(depth.buy_orders.values()) if depth.buy_orders else 0
