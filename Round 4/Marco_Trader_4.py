@@ -133,16 +133,17 @@ class Trader:
     # Negative values push option quote_fair lower:
     #   - passive bids become less likely to fill
     #   - passive asks move closer to ask-1 and are more likely to fill
-    # This tests whether a stronger passive short-vol bias improves Trader 4.
+    # Trader 29: scale all entries to 125% of Trader 25 baseline to test
+    # whether stronger passive short-vol bias adds more PNL.
     VOL_SELL_BIAS = {
-        "VEV_4000": -6.0,
-        "VEV_4500": -4.5,
-        "VEV_5000": -3.5,
-        "VEV_5100": -4.0,
-        "VEV_5200": -3.5,
-        "VEV_5300": -3.5,
-        "VEV_5400": -2.0,
-        "VEV_5500": -1.0,
+        "VEV_4000": -7.5,
+        "VEV_4500": -5.625,
+        "VEV_5000": -4.375,
+        "VEV_5100": -5.0,
+        "VEV_5200": -4.375,
+        "VEV_5300": -4.375,
+        "VEV_5400": -2.5,
+        "VEV_5500": -1.25,
     }
 
     # Larger passive sizes from Trader 13.
