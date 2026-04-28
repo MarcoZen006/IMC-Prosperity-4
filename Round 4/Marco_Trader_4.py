@@ -170,10 +170,9 @@ class Trader:
     # full hedging would be partial. Capping at +-80 keeps the hedge cost
     # bounded in trending sessions while still providing some directional
     # protection against a vol spike.
-    # Trader 33: drop hedge cap from 70 -> 60.
-    # Trader 32 (70) was +312 PNL vs Trader 29 (80).
-    # Less hedging keeps helping; pushing further.
-    VELVET_HEDGE_CAP = 60
+    # Trader 34: drop hedge cap from 60 -> 50.
+    # Trader 32 (70): +312, Trader 33 (60): +245 cumulative. Pushing further.
+    VELVET_HEDGE_CAP = 50
 
     HYDRO_INVENTORY_SKEW_MULT = 2.5
 
