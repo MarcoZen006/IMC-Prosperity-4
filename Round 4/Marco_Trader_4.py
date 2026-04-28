@@ -116,6 +116,23 @@ class Trader:
         "VEV_6500": 999.0,
     }
 
+
+    # Passive option quote bias from Trader 13.
+    # Negative values push option quote_fair lower:
+    #   - passive bids become less likely to fill
+    #   - passive asks move closer to ask-1 and are more likely to fill
+    # This tests whether a stronger passive short-vol bias improves Trader 4.
+    VOL_SELL_BIAS = {
+        "VEV_4000": -6.0,
+        "VEV_4500": -4.5,
+        "VEV_5000": -3.5,
+        "VEV_5100": -4.0,
+        "VEV_5200": -3.5,
+        "VEV_5300": -3.5,
+        "VEV_5400": -2.0,
+        "VEV_5500": -1.0,
+    }
+
     BASE_PASSIVE_SIZE = {
         HYDROGEL: 10,
         VELVET: 8,           # smaller — VELVET is hedge-driven now
@@ -360,7 +377,8 @@ class Trader:
             if product == self.HYDROGEL else 2.0
         )
         inventory_skew = inv * make_edge * skew_mult
-        quote_fair = fair - inventory_skew
+        vol_bias = self.VOL_SELL_BIAS.get(product, 0.0)
+        quote_fair = fair - inventory_skew + vol_bias
 
         buy_price = int(math.floor(quote_fair - make_edge))
         sell_price = int(math.ceil(quote_fair + make_edge))
