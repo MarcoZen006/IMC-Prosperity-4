@@ -34,10 +34,7 @@ class Trader:
         "VEV_6500": 6500,
     }
 
-    # Near-the-money vouchers caused the large local backtester drawdown. Their
-    # value depends heavily on the fitted vol curve, which is not stable enough
-    # across local public data and IMC submission data. Keep them in the curve
-    # fit, but only trade vouchers with a large intrinsic cushion.
+    # Only trade vouchers with enough intrinsic value.
     MIN_VOUCHER_INTRINSIC_CUSHION = 250.0
     MIN_INTRINSIC_PRICE_RATIO = 0.75
 
@@ -84,6 +81,7 @@ class Trader:
         self.total_vol_ema: float = 0.035
 
     def load_memory(self, trader_data: str) -> None:
+        """Load saved values from the previous run."""
         if not trader_data:
             return
         try:
@@ -99,6 +97,7 @@ class Trader:
             self.total_vol_ema = 0.035
 
     def save_memory(self) -> str:
+        """Save values for the next run."""
         try:
             return json.dumps({
                 "past_microprices": self.past_microprices,
@@ -110,6 +109,7 @@ class Trader:
             return ""
 
     def params_for(self, product: str) -> Dict[str, float]:
+        """Return blended parameters for a product."""
         if product in self.PRODUCT_PARAMS:
             product_params = self.PRODUCT_PARAMS[product]
         elif product.startswith("VEV_"):
@@ -126,10 +126,12 @@ class Trader:
 
     @staticmethod
     def normal_cdf(x: float) -> float:
+        """Return the standard normal CDF."""
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
     @classmethod
     def black_scholes_call(cls, spot: float, strike: float, total_vol: float) -> float:
+        """Return the Black-Scholes call value."""
         if spot <= 0.0 or strike <= 0.0:
             return 0.0
         if total_vol <= 1e-9:
@@ -142,6 +144,7 @@ class Trader:
 
     @classmethod
     def black_scholes_delta(cls, spot: float, strike: float, total_vol: float) -> float:
+        """Return the Black-Scholes call delta."""
         if spot <= 0.0 or strike <= 0.0:
             return 0.0
         if total_vol <= 1e-9:
@@ -151,17 +154,20 @@ class Trader:
         return cls.normal_cdf(d1)
 
     def best_bid_ask(self, order_depth: OrderDepth) -> Tuple[Optional[int], Optional[int]]:
+        """Return the best bid and ask."""
         best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
         best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
         return best_bid, best_ask
 
     def top_mid(self, order_depth: OrderDepth) -> Optional[float]:
+        """Return the simple top-of-book mid."""
         best_bid, best_ask = self.best_bid_ask(order_depth)
         if best_bid is None or best_ask is None:
             return None
         return 0.5 * (best_bid + best_ask)
 
     def calculate_microprice(self, order_depth: OrderDepth) -> Optional[float]:
+        """Calculate a blended top and depth microprice."""
         best_bid, best_ask = self.best_bid_ask(order_depth)
         if best_bid is None or best_ask is None:
             return None
@@ -197,6 +203,7 @@ class Trader:
         return 0.70 * top_micro + 0.30 * depth_micro
 
     def update_signals(self, product: str, microprice: float, alpha: float, max_var: float) -> Tuple[float, float]:
+        """Update volatility and short-term slope."""
         if product not in self.past_microprices:
             self.past_microprices[product] = microprice
             self.volatility_ema[product] = 1.0
@@ -220,10 +227,12 @@ class Trader:
         return variance, slope
 
     def buy_capacity(self, state: TradingState, product: str) -> int:
+        """Return remaining buy capacity."""
         limit = self.POSITION_LIMITS[product]
         return max(0, limit - state.position.get(product, 0))
 
     def sell_capacity(self, state: TradingState, product: str) -> int:
+        """Return remaining sell capacity."""
         limit = self.POSITION_LIMITS[product]
         return max(0, limit + state.position.get(product, 0))
 
@@ -236,12 +245,14 @@ class Trader:
         buy_qty: int,
         sell_qty: int,
     ) -> None:
+        """Add passive bid and ask quotes."""
         if bid_price >= 0 and buy_qty > 0:
             orders.append(Order(product, bid_price, buy_qty))
         if ask_price >= 0 and sell_qty > 0:
             orders.append(Order(product, ask_price, -sell_qty))
 
     def order_book_imbalance(self, order_depth: OrderDepth) -> float:
+        """Return imbalance from the top three levels."""
         bid_levels = [
             abs(volume)
             for _, volume in sorted(order_depth.buy_orders.items(), reverse=True)[:3]
@@ -266,6 +277,7 @@ class Trader:
         voucher_spreads: Dict[str, float],
         exclude_product: Optional[str] = None,
     ) -> Optional[float]:
+        """Fit total volatility from the voucher chain."""
         observations: List[Tuple[str, float, float, float]] = []
 
         for product, strike in self.VOUCHER_STRIKES.items():
@@ -277,16 +289,13 @@ class Trader:
 
             spread = max(1.0, voucher_spreads.get(product, 1.0))
 
-            # Deep floor vouchers carry almost no information about volatility when
-            # their displayed market is just 0/1. Keep them tradable, but do not let
-            # them drag the whole curve fit.
+            # Ignore deep floor vouchers in the vol fit.
             if mid <= 0.75 and strike > spot + 300.0:
                 continue
 
             weight = 1.0 / ((1.0 + spread) ** 2)
 
-            # Very deep ITM vouchers are mostly intrinsic value. They help anchor
-            # parity, but they should not dominate the volatility fit.
+            # Deep ITM vouchers should not dominate the curve.
             if spot - strike > 700.0:
                 weight *= 0.35
 
@@ -298,9 +307,7 @@ class Trader:
         best_w = self.total_vol_ema
         best_error = float("inf")
 
-        # Wide, model-based grid over total volatility sigma*sqrt(T).
-        # This is not calibrated to a specific day; it is re-estimated live from the
-        # current option chain every timestamp.
+        # Search for the best total volatility.
         for i in range(60):
             w = 0.005 + i * (0.220 - 0.005) / 59.0
             total_error = 0.0
@@ -311,8 +318,7 @@ class Trader:
                 spread = max(1.0, voucher_spreads.get(_, 1.0))
                 scaled_error = (model - mid) / spread
 
-                # Huber-style cap prevents one stale or crossed product from moving
-                # the whole option curve.
+                # Limit the impact of bad or stale prices.
                 scaled_error = max(-5.0, min(5.0, scaled_error))
                 total_error += weight * scaled_error * scaled_error
                 total_weight += weight
@@ -330,6 +336,7 @@ class Trader:
         self,
         state: TradingState,
     ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Tuple[int, int]]]:
+        """Collect voucher mids, spreads, and best quotes."""
         mids: Dict[str, float] = {}
         spreads: Dict[str, float] = {}
         bests: Dict[str, Tuple[int, int]] = {}
@@ -356,6 +363,7 @@ class Trader:
         voucher_mids: Dict[str, float],
         voucher_spreads: Dict[str, float],
     ) -> List[Order]:
+        """Trade one voucher using the fitted option curve."""
         orders: List[Order] = []
         strike = self.VOUCHER_STRIKES[product]
         best_bid, best_ask = self.best_bid_ask(order_depth)
@@ -383,17 +391,13 @@ class Trader:
 
         model_fair = self.black_scholes_call(spot, strike, total_vol)
 
-        # No-arbitrage floor: a call should not be priced below intrinsic value.
-        # For far OTM vouchers, do not force a 0/1 tick-floor value into the model;
-        # only trade them when the fair value genuinely supports it.
+        # Keep fair at least intrinsic.
         fair = max(model_fair, intrinsic)
 
         delta = self.black_scholes_delta(spot, strike, total_vol)
         inv_frac = position / limit if limit > 0 else 0.0
 
-        # Inventory-adjusted fair: if long, become more willing to sell; if short,
-        # become more willing to buy. Delta makes ITM vouchers receive stronger
-        # inventory pressure than tiny far-OTM vouchers.
+        # Shift fair against current inventory.
         inventory_shift = inv_frac * max(1.0, 0.45 * spread) * (1.0 + 2.0 * delta)
         fair_adj = fair - inventory_shift
 
@@ -404,7 +408,7 @@ class Trader:
             top_depth += abs(order_depth.sell_orders[best_ask])
         base_size = max(1, min(18, top_depth // 3 if top_depth > 0 else 4))
 
-        # Larger edge gets more size, but never jumps to the position limit in one tick.
+        # Use more size when edge is stronger.
         min_take_edge = max(1.0, 0.55 * spread, 0.006 * max(20.0, fair))
         bought = 0
         sold = 0
@@ -453,7 +457,7 @@ class Trader:
             bid_quote = mid_quote - 1
             ask_quote = mid_quote + 1
 
-        # Never cross the visible market with passive quotes.
+        # Keep passive quotes outside the spread.
         if bid_quote >= best_ask:
             bid_quote = best_ask - 1
         if ask_quote <= best_bid:
@@ -462,8 +466,7 @@ class Trader:
         quote_buy = min(base_size, remaining_buy)
         quote_sell = min(base_size, remaining_sell)
 
-        # Do not keep adding to stretched inventory. Keep quoting the side that
-        # reduces risk.
+        # Avoid adding more risk when inventory is already stretched.
         if position > 0.55 * limit:
             quote_buy = 0
             quote_sell = min(remaining_sell, max(quote_sell, base_size))
@@ -471,7 +474,7 @@ class Trader:
             quote_sell = 0
             quote_buy = min(remaining_buy, max(quote_buy, base_size))
 
-        # Only quote a side when the model says that side is not obviously bad.
+        # Only quote when the side still makes sense.
         if fair_adj < best_bid + 0.20 * spread:
             quote_buy = 0
         if fair_adj > best_ask - 0.20 * spread:
@@ -495,14 +498,14 @@ class Trader:
         intrinsic: float,
         market_mid: float,
     ) -> bool:
+        """Return whether a voucher is safe enough to trade."""
         if product not in self.VOUCHER_STRIKES:
             return False
 
         if intrinsic < self.MIN_VOUCHER_INTRINSIC_CUSHION:
             return False
 
-        # Avoid buying optionality priced mostly by the fitted vol curve. The
-        # backtester loss came from VEV_5200/VEV_5300 where this ratio was small.
+        # Avoid vouchers priced mostly from unstable optionality.
         if market_mid < self.MIN_INTRINSIC_PRICE_RATIO * intrinsic:
             return False
 
@@ -514,6 +517,7 @@ class Trader:
         order_depth: OrderDepth,
         state: TradingState,
     ) -> List[Order]:
+        """Reduce voucher inventory when trading is disabled."""
         orders: List[Order] = []
         position = state.position.get(product, 0)
         if position == 0:
@@ -538,6 +542,7 @@ class Trader:
         state: TradingState,
         extra_inventory: float = 0.0,
     ) -> List[Order]:
+        """Run the generic market-making logic."""
         orders: List[Order] = []
 
         params = self.params_for(product)
@@ -678,6 +683,7 @@ class Trader:
         return orders
 
     def current_option_delta_inventory(self, state: TradingState, spot: float, total_vol: float) -> float:
+        """Return current option delta exposure."""
         delta_inventory = 0.0
         for product, strike in self.VOUCHER_STRIKES.items():
             position = state.position.get(product, 0)
@@ -734,9 +740,7 @@ class Trader:
                     voucher_spreads,
                 )
             elif product == "VELVETFRUIT_EXTRACT":
-                # Use the underlying as the hedge/anchor for the voucher book.
-                # The delta term is soft: it shifts quotes without forcing expensive
-                # hedge trades through the spread.
+                # Use VELVET as a soft hedge for voucher delta.
                 result[product] = self.trade_generic_market_maker(
                     product,
                     order_depth,
