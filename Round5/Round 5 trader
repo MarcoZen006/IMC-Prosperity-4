@@ -6,17 +6,9 @@ from datamodel import OrderDepth, TradingState, Order
 
 class Trader:
     """
-    Universal active profit model v10.
-
-    Key fix versus the $0 adaptive versions:
-    - It does NOT ignore unknown products.
-    - It trades every product in state.order_depths.
-    - It keeps the original profitable microprice/volatility/reservation-price core.
-    - It uses only light adaptive controls, not a fragile theoretical model.
-
-    The only product-specific logic is a defensive position-limit guess. Official
-    Round 3 limits are used when recognised; unknown products use a conservative
-    default so the bot still trades instead of returning $0.
+    Active trading bot round 5.
+    Trades all available products using microprice, volatility, and reservation
+    price logic, with light risk controls and safe default limits for unknown products.
     """
 
     KNOWN_LIMITS = {
@@ -42,6 +34,7 @@ class Trader:
         self.fill_bias: Dict[str, float] = {}
 
     def limit_for(self, product: str) -> int:
+        """Return the position limit for a product."""
         if product in self.KNOWN_LIMITS:
             return self.KNOWN_LIMITS[product]
         name = product.upper()
@@ -52,6 +45,7 @@ class Trader:
         return 50
 
     def load_state(self, trader_data: str) -> None:
+        """Load saved values from the previous run."""
         if not trader_data:
             return
         try:
@@ -65,6 +59,7 @@ class Trader:
             pass
 
     def save_state(self) -> str:
+        """Save values needed for the next run."""
         try:
             return json.dumps({
                 "past": self.past_microprices,
@@ -77,11 +72,13 @@ class Trader:
             return ""
 
     def best_bid_ask(self, order_depth: OrderDepth) -> Tuple[Optional[int], Optional[int]]:
+        """Return the best bid and best ask prices."""
         best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
         best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
         return best_bid, best_ask
 
     def microprice(self, order_depth: OrderDepth) -> Optional[float]:
+        """Calculate the volume-weighted microprice."""
         best_bid, best_ask = self.best_bid_ask(order_depth)
         if best_bid is None or best_ask is None:
             return None
@@ -93,12 +90,14 @@ class Trader:
         return (best_bid * ask_vol + best_ask * bid_vol) / total
 
     def mid_price(self, order_depth: OrderDepth) -> Optional[float]:
+        """Calculate the mid price from the best bid and ask."""
         best_bid, best_ask = self.best_bid_ask(order_depth)
         if best_bid is None or best_ask is None:
             return None
         return (best_bid + best_ask) / 2.0
 
     def imbalance(self, order_depth: OrderDepth) -> float:
+        """Measure order book imbalance at the best bid and ask."""
         best_bid, best_ask = self.best_bid_ask(order_depth)
         if best_bid is None or best_ask is None:
             return 0.0
@@ -110,6 +109,7 @@ class Trader:
         return max(-1.0, min(1.0, (bid_vol - ask_vol) / total))
 
     def update_models(self, product: str, micro: float, mid: float) -> Tuple[float, float, float]:
+        """Update the stored volatility, mid-price EMA, and momentum."""
         if product not in self.past_microprices:
             self.past_microprices[product] = micro
             self.volatility_ema[product] = 1.0
@@ -136,13 +136,15 @@ class Trader:
         return new_var, new_ema, new_mom
 
     def time_fraction(self, timestamp: int) -> float:
+        """Convert the timestamp into a value between 0 and 1."""
         if timestamp <= 0:
             return 0.0
-        # Backtesters may use either 100k or 1m max timestamp.
+        # Some backtesters end at 100k, while others end at 1m.
         denom = 100000.0 if timestamp <= 100000 else 1000000.0
         return max(0.0, min(1.0, timestamp / denom))
 
     def position(self, state: TradingState, product: str) -> int:
+        """Return the current position for a product."""
         return state.position.get(product, 0)
 
     def add_order(
@@ -154,6 +156,7 @@ class Trader:
         position_after: int,
         limit: int,
     ) -> int:
+        """Add an order while keeping the position inside the limit."""
         if quantity == 0 or price < 0:
             return position_after
 
@@ -195,15 +198,13 @@ class Trader:
             spread = max(1, best_ask - best_bid)
             imb = self.imbalance(order_depth)
 
-            # Fair value stays very close to microprice so the bot remains active.
-            # These are universal formula coefficients, not per-product tuning.
+            # Keep fair value close to microprice so the bot stays active.
             momentum_lean = max(-1.20, min(1.20, 0.10 * momentum))
             imbalance_lean = 0.20 * imb * max(1.0, min(2.0, spread / 2.0))
             ema_lean = max(-1.0, min(1.0, 0.06 * (ema - micro)))
             fair = micro + momentum_lean + imbalance_lean + ema_lean
 
-            # Original profitable Avellaneda-style inventory control.
-            # Risk increases smoothly with time rather than fixed shutdowns.
+            # Shift the reservation price based on inventory and late-game risk.
             risk_mult = 1.0 + 0.55 * (t ** 2)
             inventory_penalty = pos0 * 0.050 * variance * risk_mult
             soft_limit_skew = math.tanh(2.0 * inv_ratio) * (0.85 + 0.12 * vol) * risk_mult
@@ -212,17 +213,17 @@ class Trader:
             half_spread = 2.0 + 0.50 * vol
             half_spread = max(1.0, min(half_spread, 24.0))
 
-            # Size follows your original profitable formula.
+            # Trade smaller when volatility or inventory is high.
             size = max(1, int(10 / max(1.0, vol)))
             size = max(1, int(size * (1.0 - min(0.60, abs(inv_ratio)))))
 
-            # Light late risk control, but never shut off completely.
+            # Reduce size near the end, but keep trading.
             if t > 0.88:
                 size = max(1, int(size * 0.80))
             if t > 0.94:
                 size = max(1, int(size * 0.60))
 
-            # 1) Take clear mispricings first. This mirrors your original bot.
+            # Take clear profitable prices before placing passive quotes.
             if best_ask < reservation - half_spread:
                 if not (t > 0.90 and pos0 > 0):
                     qty = min(abs(order_depth.sell_orders[best_ask]), size)
@@ -233,11 +234,11 @@ class Trader:
                     qty = min(abs(order_depth.buy_orders[best_bid]), size)
                     pos_after = self.add_order(orders, product, best_bid, -qty, pos_after, limit)
 
-            # 2) Always quote close enough to trade. This prevents $0 outcomes.
+            # Place quotes close enough to the market to avoid sitting inactive.
             opt_bid = math.floor(reservation - half_spread)
             opt_ask = math.ceil(reservation + half_spread)
 
-            # Make the quote competitive without crossing the spread.
+            # Improve the quote when the spread gives enough room.
             if spread >= 3:
                 quote_bid = min(best_ask - 1, max(best_bid + 1, opt_bid))
                 quote_ask = max(best_bid + 1, min(best_ask - 1, opt_ask))
@@ -249,7 +250,7 @@ class Trader:
                 quote_bid = best_bid
                 quote_ask = best_ask
 
-            # Inventory-aware size balance.
+            # Lean order sizes toward reducing inventory.
             buy_size = size
             sell_size = size
             if pos0 > 0:
@@ -267,8 +268,7 @@ class Trader:
             if allow_sell:
                 pos_after = self.add_order(orders, product, quote_ask, -sell_size, pos_after, limit)
 
-            # 3) Conditional inventory release near the end.
-            # Not a hard shutdown: only fires if the inventory is actually large.
+            # Release some inventory near the end if the position is too large.
             if t > 0.90 and abs(pos0) > max(5, int(0.06 * limit)):
                 exit_qty = max(1, min(abs(pos0) // 3, size * 3))
                 if pos0 > 0:
