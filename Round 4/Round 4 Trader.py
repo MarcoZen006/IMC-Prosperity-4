@@ -6,42 +6,9 @@ import math
 
 class Trader:
     """
-    Trader 4 — vol-aware market maker with delta-hedged VELVET.
-
-    Edge model (unchanged from T3 in spirit):
-      Sell OTM VEV vouchers because realized VELVET vol (~11%) is far below
-      market-implied vol (~22%). BSM with a low sigma -> fair ~ intrinsic ->
-      every OTM call looks overpriced -> sell.
-
-    Changes from Trader 3:
-      1. VELVET no longer trades on its own MM signal.
-         It's now driven only by a delta-hedge target against current short
-         option positions, capped at +-80 (down from +-200). This addresses
-         the -5,354 VELVET loss in 490207, which came from the standalone
-         take-edge logic pinning VELVET at +200 from ts=19,200 onwards.
-
-      2. HYDROGEL has an end-of-session cooldown.
-         No aggressive cross-the-spread takes in the last 1,000 ticks.
-         Only passive quotes. This prevents the ts=99,000-99,400 spree that
-         bought 65 contracts at 10,025-10,029 right before the close at 10,017.
-
-      3. Bidirectional voucher take-logic.
-         Old code only crossed asks (buy at ask) when fair was high; sells
-         only via passive maker quotes. Now also crosses bids (sell to bid)
-         when fair > best_bid + edge AND we have inventory to sell. This
-         is mostly defensive (capture profit faster, allow exit).
-
-      4. Removed the mark-counterparty learning subsystem.
-         Lag was 5,000 ticks vs ~1,000 timestamps/day with ~50 mature samples
-         per session. Effectively noise. Removing it simplifies the file and
-         reduces traderData size.
-
-      5. Removed ema_ret directional bias on HYDROGEL/VELVET fair value.
-         This was injecting a momentum bet that compounded the VELVET
-         long-bias problem. Fair = EMA + OBI weight only.
-
-      6. HYDROGEL inventory skew bumped from 2.0x to 2.5x make_edge.
-         Pushes us out of inventory faster.
+    Round 4 trader.
+    Trades HYDROGEL and VEV vouchers. VELVET is disabled for now.
+    Uses low-vol BSM pricing, inventory control, and passive quotes.
     """
 
     HYDROGEL = "HYDROGEL_PACK"
@@ -69,13 +36,10 @@ class Trader:
         "VEV_6500": 300,
     }
 
-    # 0.5 floor instruments — never edge available
+    # These vouchers usually sit at the floor, so skip trading them.
     FLOOR_VOUCHERS = {"VEV_6000", "VEV_6500"}
 
-    # BSM sigma for fair-value calculation. The strategy works for any small
-    # sigma here because the edge comes from realized vs implied gap, not
-    # from the absolute level. 0.10 gives nontrivial time-value so the
-    # buy-back leg works for ATM-ish strikes if vol cools mid-day.
+    # Low BSM volatility used to value vouchers conservatively.
     OPTION_SIGMA = 0.10
 
     EMA_ALPHA = {
@@ -84,22 +48,19 @@ class Trader:
         "default": 0.10,
     }
 
-    # HYDROGEL mean-reversion / short-term reversal model from Trader 13.
-    # This only changes HYDROGEL fair value; voucher logic and VELVET hedge
-    # settings are left unchanged so this can be tested in isolation.
+    # HYDROGEL mean-reversion settings.
     HYDRO_MU = 9995.4
-    # Trader 25: drop from 0.15 -> 0.10 to test weaker mean-reversion pull
-    # (Trader 24 confirmed 0.20 is too strong, -200 PNL).
     HYDRO_OU_PULL = 0.10
+
     ACF1 = {
         HYDROGEL: -0.124,
         VELVET: -0.160,
     }
 
-    # Take edge (cross-the-spread threshold)
+    # Edge needed before crossing the spread.
     TAKE_EDGE = {
         HYDROGEL: 4.0,
-        VELVET: 1.5,         # used by hedge-only logic
+        VELVET: 1.5,
         "VEV_4000": 3.0,
         "VEV_4500": 2.5,
         "VEV_5000": 1.1,
@@ -112,7 +73,7 @@ class Trader:
         "VEV_6500": 999.0,
     }
 
-    # Make edge (passive quote distance)
+    # Distance used for passive quotes.
     MAKE_EDGE = {
         HYDROGEL: 4.0,
         VELVET: 1.5,
@@ -128,13 +89,7 @@ class Trader:
         "VEV_6500": 999.0,
     }
 
-
-    # Passive option quote bias from Trader 13.
-    # Negative values push option quote_fair lower:
-    #   - passive bids become less likely to fill
-    #   - passive asks move closer to ask-1 and are more likely to fill
-    # Trader 29: scale all entries to 125% of Trader 25 baseline to test
-    # whether stronger passive short-vol bias adds more PNL.
+    # Push voucher quote fair lower to favour selling options.
     VOL_SELL_BIAS = {
         "VEV_4000": -7.5,
         "VEV_4500": -5.625,
@@ -146,22 +101,16 @@ class Trader:
         "VEV_5500": -1.25,
     }
 
-    # Larger passive sizes from Trader 13.
-    # This keeps the same fair-value / quoting logic, but increases maker
-    # participation where the previous tests showed useful edge.
-    # Trader 58: HYDROGEL passive size 15 -> 25.
-    # Vouchers saturate at current sizes (T41 showed +5 was -37). HYDROGEL
-    # has rich MR/OU/OBI fair-value signal and no clamp on size. More
-    # passive flow = more captured spread + more inventory cycling, with
-    # the 0.25 scaling floor still protecting at extreme inventory.
+    # Base size for passive quotes.
     BASE_PASSIVE_SIZE = {
         HYDROGEL: 25,
-        VELVET: 8,           # VELVET remains hedge-driven
+        VELVET: 8,
         "VEV_4000": 10, "VEV_4500": 10, "VEV_5000": 18,
         "VEV_5100": 20, "VEV_5200": 25, "VEV_5300": 25,
         "VEV_5400": 20, "VEV_5500": 15,
     }
 
+    # Max size for aggressive orders.
     MAX_TAKE_SIZE = {
         HYDROGEL: 24,
         VELVET: 30,
@@ -170,29 +119,16 @@ class Trader:
         "VEV_5400": 24, "VEV_5500": 16,
     }
 
-    # Hedge target cap. With 5 vouchers x -300 max short, total short delta
-    # at ATM-ish ~2.5, so net delta ~ -750. Limit is +200 on VELVET. Even
-    # full hedging would be partial. Capping at +-80 keeps the hedge cost
-    # bounded in trending sessions while still providing some directional
-    # protection against a vol spike.
-    # Trader 39: drop hedge cap from 10 -> 0 (no hedging at all).
-    # T32:30001, T33:30246, T34:30576, T35:30922, T36:31303, T37:31700,
-    # T38:32104. Testing if VELVET hedge is purely a drag.
+    # Hedge cap is zero, so VELVET hedging is disabled.
     VELVET_HEDGE_CAP = 0
 
-    # Trader 42: drop HYDRO_INVENTORY_SKEW_MULT 2.5 -> 2.0.
-    # With OU mean-reversion + AR(1) reversal in HYDROGEL fair, holding
-    # inventory longer may let mean-reversion realize before we skew out.
+    # Stronger inventory skew for HYDROGEL.
     HYDRO_INVENTORY_SKEW_MULT = 2.0
 
-    # In last X ticks of session, no aggressive crossing on HYDROGEL.
-    # Prevents the kind of late-day adverse selection that cost ~600 in
-    # 490207 (ts=99,000-99,400 buying spree).
+    # Stop aggressive HYDROGEL takes near the end.
     EOD_COOLDOWN_TICKS = 1000
 
-    DAY_TIMESTAMPS = 100_000  # one day spans timestamps 0 -> 99,900
-
-    # ---- main loop ------------------------------------------------------
+    DAY_TIMESTAMPS = 100_000
 
     def run(self, state: TradingState):
         data = self._load_data(state.traderData)
@@ -212,7 +148,7 @@ class Trader:
         tte_days = max(0.0, 7.0 - days_passed)
         T = max(1e-6, tte_days / 252.0)
 
-        # 1) Trade vouchers and HYDROGEL first (these set the option positions).
+        # Trade vouchers and HYDROGEL first.
         for product, depth in state.order_depths.items():
             if product not in self.LIMITS or product == self.VELVET:
                 continue
@@ -229,16 +165,11 @@ class Trader:
             if orders:
                 result[product] = orders
 
-        # 2) Trader 40: VELVET trading disabled entirely.
-        # Trader 39 with hedge cap = 0 already removed directional hedging,
-        # leaving only passive MM. This tests whether even that residual
-        # VELVET activity is a drag.
-
+        # VELVET trading is disabled in this version.
         return result, conversions, self._dump_data(data)
 
-    # ---- state ----------------------------------------------------------
-
     def _load_data(self, trader_data: str) -> Dict:
+        """Load saved trader data."""
         if trader_data:
             try:
                 data = json.loads(trader_data)
@@ -261,9 +192,11 @@ class Trader:
         }
 
     def _dump_data(self, data: Dict) -> str:
+        """Save trader data compactly."""
         return json.dumps(data, separators=(",", ":"))
 
     def _update_day_counter(self, state: TradingState, data: Dict) -> None:
+        """Track when the backtest rolls into a new day."""
         last = data.get("last_timestamp")
         if last is not None and state.timestamp < int(last):
             data["day_index"] = int(data.get("day_index", 0)) + 1
@@ -272,6 +205,7 @@ class Trader:
     def _update_mids_and_ema(
         self, state: TradingState, data: Dict
     ) -> Dict[str, float]:
+        """Update mid prices and EMAs."""
         mids: Dict[str, float] = {}
 
         for product, depth in state.order_depths.items():
@@ -296,8 +230,6 @@ class Trader:
 
         return mids
 
-    # ---- fair value -----------------------------------------------------
-
     def _fair_value(
         self,
         product: str,
@@ -307,10 +239,12 @@ class Trader:
         velvet_mid: float,
         T: float,
     ) -> float:
+        """Calculate fair value for one product."""
         if product in self.VOUCHERS:
             strike = self.VOUCHERS[product]
             fair = self._bsm_call(velvet_mid, strike, T, self.OPTION_SIGMA)
-            # Floor for deep ITM
+
+            # Keep deep ITM calls above intrinsic value.
             intrinsic = max(0.0, velvet_mid - strike)
             if strike <= 5000:
                 fair = max(fair, intrinsic + 0.5)
@@ -333,8 +267,6 @@ class Trader:
 
         return ema + 2.0 * obi
 
-    # ---- voucher / HYDROGEL trading ------------------------------------
-
     def _trade_product(
         self,
         product: str,
@@ -343,6 +275,7 @@ class Trader:
         working_pos: Dict[str, int],
         timestamp: int,
     ) -> List[Order]:
+        """Create orders for HYDROGEL or a voucher."""
         best_bid, bid_vol, best_ask, ask_vol = self._best_quotes(depth)
         if best_bid is None or best_ask is None:
             return []
@@ -356,15 +289,14 @@ class Trader:
         base_size = self.BASE_PASSIVE_SIZE.get(product, 12)
         max_take = self.MAX_TAKE_SIZE.get(product, 24)
 
-        # End-of-session cooldown for HYDROGEL: skip aggressive takes only.
-        # Passive quoting still runs.
+        # Skip aggressive HYDROGEL takes near the end.
         eod_cooldown = (
             product == self.HYDROGEL
             and timestamp >= (self.DAY_TIMESTAMPS - self.EOD_COOLDOWN_TICKS)
         )
 
         if not eod_cooldown:
-            # Buy: cross ask if fair >> ask
+            # Buy when the ask is cheap enough.
             buy_edge = fair - best_ask
             if buy_edge > take_edge and pos < limit:
                 qty = min(
@@ -376,7 +308,7 @@ class Trader:
                 self._append_order(orders, working_pos, product, best_ask, qty)
                 pos = working_pos.get(product, 0)
 
-            # Sell: cross bid if fair << bid
+            # Sell when the bid is high enough.
             sell_edge = best_bid - fair
             if sell_edge > take_edge and pos > -limit:
                 qty = min(
@@ -388,15 +320,14 @@ class Trader:
                 self._append_order(orders, working_pos, product, best_bid, -qty)
                 pos = working_pos.get(product, 0)
 
-        # Passive quoting always runs (this is how we enter positions
-        # cheaply when the spread is wide).
+        # Passive quotes stay active when the spread is wide.
         spread = best_ask - best_bid
         if spread <= 1:
             return orders
 
         inv = pos / limit if limit > 0 else 0.0
 
-        # Stronger inventory skew on HYDROGEL specifically.
+        # Skew quotes away from adding too much inventory.
         skew_mult = (
             self.HYDRO_INVENTORY_SKEW_MULT
             if product == self.HYDROGEL else 2.0
@@ -426,23 +357,13 @@ class Trader:
 
         return orders
 
-    # ---- VELVET hedge logic --------------------------------------------
-
     def _velvet_hedge_target(
         self,
         working_pos: Dict[str, int],
         velvet_mid: float,
         T: float,
     ) -> int:
-        """
-        Compute desired VELVET position to hedge net option delta.
-
-        net_call_position = sum_k (position_k * delta_k)
-          if positive, we are long calls -> long delta -> hedge by short VELVET
-          if negative, we are short calls -> short delta -> hedge by long VELVET
-
-        Capped at +-VELVET_HEDGE_CAP (80).
-        """
+        """Return the VELVET target needed to offset option delta."""
         net_call_delta = 0.0
         for product, strike in self.VOUCHERS.items():
             if product in self.FLOOR_VOUCHERS:
@@ -453,7 +374,6 @@ class Trader:
             d = self._bsm_delta(velvet_mid, strike, T, self.OPTION_SIGMA)
             net_call_delta += qty * d
 
-        # Hedge = -net_call_delta (offset)
         target = int(round(-net_call_delta))
         cap = self.VELVET_HEDGE_CAP
         return max(-cap, min(cap, target))
@@ -465,17 +385,13 @@ class Trader:
         working_pos: Dict[str, int],
         target: int,
     ) -> List[Order]:
-        """
-        Move VELVET toward hedge target. Use take-orders aggressively only
-        when the move is in our direction AND the price is favorable. Use
-        passive quotes for the rest.
-        """
+        """Move VELVET closer to the hedge target."""
         best_bid, bid_vol, best_ask, ask_vol = self._best_quotes(depth)
         if best_bid is None or best_ask is None:
             return []
 
         pos = working_pos.get(self.VELVET, 0)
-        diff = target - pos  # positive = need to buy, negative = need to sell
+        diff = target - pos
         orders: List[Order] = []
 
         take_edge = self.TAKE_EDGE[self.VELVET]
@@ -483,8 +399,7 @@ class Trader:
         base_size = self.BASE_PASSIVE_SIZE[self.VELVET]
         max_take = self.MAX_TAKE_SIZE[self.VELVET]
 
-        # Aggressive take only if (a) book is favorable AND (b) move aligns
-        # with hedge target.
+        # Take only when price and hedge direction both line up.
         if diff > 0:
             buy_edge = fair - best_ask
             if buy_edge > take_edge:
@@ -500,26 +415,24 @@ class Trader:
                     self._append_order(orders, working_pos, self.VELVET, best_bid, -qty)
                     pos = working_pos.get(self.VELVET, 0)
 
-        # Passive quotes biased toward target.
+        # Use passive quotes for smaller hedge moves.
         spread = best_ask - best_bid
         if spread <= 1:
             return orders
 
-        # Pull bid up / push ask up if we want to BUY (diff > 0)
-        # Pull ask down / push bid down if we want to SELL (diff < 0)
+        # Skew quote fair slightly toward the hedge target.
         bias = max(-1.0, min(1.0, diff / max(1, self.VELVET_HEDGE_CAP)))
-        quote_fair = fair + bias * 0.5  # small skew toward target
+        quote_fair = fair + bias * 0.5
 
         buy_price = int(math.floor(quote_fair - make_edge))
         sell_price = int(math.ceil(quote_fair + make_edge))
         buy_price = min(buy_price, best_bid + 1, best_ask - 1)
         sell_price = max(sell_price, best_ask - 1, best_bid + 1)
 
-        # Only place a passive bid if we want to (or are willing to) be long.
+        # Only bid when buying is still acceptable.
         if diff > -base_size and buy_price > 0 and buy_price < best_ask:
             limit_room = self.LIMITS[self.VELVET] - pos
             qty = min(base_size, max(0, limit_room))
-            # Reduce size if already past target on the long side
             if pos > target:
                 qty = int(qty * 0.4)
             if qty > 0:
@@ -536,8 +449,6 @@ class Trader:
 
         return orders
 
-    # ---- low-level helpers ---------------------------------------------
-
     def _append_order(
         self,
         orders: List[Order],
@@ -546,6 +457,7 @@ class Trader:
         price: int,
         qty: int,
     ) -> None:
+        """Add an order while respecting position limits."""
         if qty == 0:
             return
 
@@ -567,6 +479,7 @@ class Trader:
     def _best_quotes(
         self, depth: OrderDepth
     ) -> Tuple[Optional[int], int, Optional[int], int]:
+        """Return best bid, bid size, best ask, and ask size."""
         best_bid = max(depth.buy_orders.keys()) if depth.buy_orders else None
         best_ask = min(depth.sell_orders.keys()) if depth.sell_orders else None
         bid_vol = depth.buy_orders[best_bid] if best_bid is not None else 0
@@ -574,19 +487,14 @@ class Trader:
         return best_bid, bid_vol, best_ask, ask_vol
 
     def _mid(self, depth: OrderDepth) -> Optional[float]:
+        """Return the simple midpoint."""
         best_bid, _, best_ask, _ = self._best_quotes(depth)
         if best_bid is None or best_ask is None:
             return None
         return 0.5 * (best_bid + best_ask)
 
     def _vwap_mid(self, depth: OrderDepth) -> Optional[float]:
-        """
-        Volume-weighted midpoint using all visible bid and ask levels.
-
-        This replaces the simple best bid/ask midpoint in the EMA update.
-        It is still non-hardcoded: it only uses current order-book prices
-        and displayed volumes.
-        """
+        """Return a volume-weighted midpoint from visible book levels."""
         if not depth.buy_orders or not depth.sell_orders:
             return self._mid(depth)
 
@@ -601,6 +509,7 @@ class Trader:
         return 0.5 * (bid_vwap + ask_vwap)
 
     def _order_book_imbalance(self, depth: OrderDepth) -> float:
+        """Return total order book imbalance."""
         bid_vol = sum(depth.buy_orders.values()) if depth.buy_orders else 0
         ask_vol = sum(abs(v) for v in depth.sell_orders.values()) if depth.sell_orders else 0
         total = bid_vol + ask_vol
@@ -609,6 +518,7 @@ class Trader:
         return (bid_vol - ask_vol) / total
 
     def _bsm_call(self, S: float, K: float, T: float, sigma: float) -> float:
+        """Return the Black-Scholes call price."""
         if T <= 0 or S <= 0 or K <= 0 or sigma <= 0:
             return max(0.0, S - K)
 
@@ -621,7 +531,7 @@ class Trader:
         return S * self._norm_cdf(d1) - K * self._norm_cdf(d2)
 
     def _bsm_delta(self, S: float, K: float, T: float, sigma: float) -> float:
-        """N(d1) — call delta in BSM."""
+        """Return the Black-Scholes call delta."""
         if T <= 0 or S <= 0 or K <= 0 or sigma <= 0:
             return 1.0 if S > K else 0.0
         total_vol = sigma * math.sqrt(T)
@@ -631,4 +541,5 @@ class Trader:
         return self._norm_cdf(d1)
 
     def _norm_cdf(self, x: float) -> float:
+        """Return the standard normal CDF."""
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
