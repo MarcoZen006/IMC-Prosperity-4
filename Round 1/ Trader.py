@@ -1,8 +1,5 @@
 """
-Marco_trader_24_hybrid.py - IMC Prosperity Round 1
-
-Hybrid trader based on trader 24.
-
+IMC Prosperity Round 1
 The main idea is to keep the original Pepper trend trade early on, then switch
 to a safer mean-reversion fallback when the trend starts looking unreliable or
 the round is getting close to the end.
