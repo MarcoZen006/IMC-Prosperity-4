@@ -1,21 +1,11 @@
 """
-Marco_trader_24_hybrid.py  –  IMC Prosperity Round 1
-====================================================
-Hybrid version of trader 24.
+Marco_trader_24_hybrid.py - IMC Prosperity Round 1
 
-What changed
-────────────
-INTARIAN_PEPPER_ROOT now has a failsafe:
-  • It still uses the original linear drift / hold-long logic while the trend
-    looks valid.
-  • If the Pepper residual becomes erratic for several consecutive ticks, it
-    latches into a fallback mode early.
-  • Even if that never happens, it force-switches at a fixed late-session
-    timestamp to an Osmium-style mean-reversion market-maker for Pepper.
+Hybrid trader based on trader 24.
 
-This gives Pepper two behaviours:
-  1) early-session trend capture,
-  2) late-session / erratic-session adaptive mean reversion.
+The main idea is to keep the original Pepper trend trade early on, then switch
+to a safer mean-reversion fallback when the trend starts looking unreliable or
+the round is getting close to the end.
 """
 
 try:
@@ -29,33 +19,33 @@ import math
 
 
 class Trader:
-    # ──────────────────────── Constants ────────────────────────
+    # Strategy settings
     POSITION_LIMITS = {
         "ASH_COATED_OSMIUM": 50,
         "INTARIAN_PEPPER_ROOT": 50,
     }
 
-    # OU parameters – calibrated via OLS on all 3 historical days
+    # Osmium OU parameters from historical data
     OU_MU: float = 10000.20   # long-run mean
-    OU_THETA: float = 0.2427  # mean-reversion speed (per tick)
-    OU_SIGMA: float = 3.494   # per-tick noise std
-    OU_STD: float = 5.014     # stationary std = σ / √(2θ)
-    OU_MU_ALPHA: float = 5e-4 # very slow μ adaptation (handles regime drift)
+    OU_THETA: float = 0.2427  # reversion speed per tick
+    OU_SIGMA: float = 3.494   # normal tick noise
+    OU_STD: float = 5.014     # long-term spread around the mean
+    OU_MU_ALPHA: float = 5e-4 # slowly moves the mean if market drifts
 
-    # Pepper linear trend model
+    # Pepper trend model
     PEPPER_SLOPE: float = 0.001000
     KF_Q: float = 0.10
     KF_R: float = 5.00
     KF_P0: float = 500.0
 
-    # Pepper fallback controls
+    # Pepper fallback timing and trigger settings
     PEPPER_FORCE_FALLBACK_TS: int = 910_000
     PEPPER_HARD_FLAT_TS: int = 995_000
     PEPPER_ERRATIC_Z: float = 3.5
     PEPPER_ERRATIC_CONFIRM_TICKS: int = 3
     PEPPER_FALLBACK_MR_WINDOW: int = 18
 
-    # ──────────────────────── State ────────────────────────────
+    # Saved state
 
     def default_state(self) -> Dict:
         return {
@@ -86,7 +76,7 @@ class Trader:
     def dump_state(self, s: Dict) -> str:
         return json.dumps(s, separators=(",", ":"))
 
-    # ──────────────────────── Market helpers ───────────────────
+    # Market helper functions
 
     def best_bid_ask(self, od: OrderDepth) -> Tuple[Optional[int], Optional[int]]:
         bb = max(od.buy_orders) if od.buy_orders else None
@@ -138,7 +128,7 @@ class Trader:
     def clamp(self, x: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, x))
 
-    # ──────────────────────── OU helpers ───────────────────────
+    # Osmium model helpers
 
     def ou_dynamic_std(self, hist: List[float]) -> float:
         sigma_hat = self.local_vol(hist)
@@ -154,7 +144,7 @@ class Trader:
         mem["ou_mu"] = (1 - self.OU_MU_ALPHA) * mem["ou_mu"] + self.OU_MU_ALPHA * mid
         return mem["ou_mu"]
 
-    # ──────────────────────── Kalman filter ────────────────────
+    # Pepper trend filter
 
     def kf_update(self, ts: int, mid: float, mem: Dict) -> float:
         obs = mid - self.PEPPER_SLOPE * ts
@@ -179,7 +169,7 @@ class Trader:
 
         return x_new + self.PEPPER_SLOPE * ts
 
-    # ──────────────────────── Order helpers ────────────────────
+    # Order helper functions
 
     def take_asks(
         self,
@@ -225,7 +215,7 @@ class Trader:
                 room -= qty
         return orders
 
-    # ──────────────────────── Osmium logic ─────────────────────
+    # Osmium trading logic
 
     def trade_osmium(
         self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
@@ -345,7 +335,7 @@ class Trader:
 
         return orders
 
-    # ──────────────────────── Pepper mode switch ───────────────
+    # Pepper mode switching
 
     def pepper_should_use_fallback(
         self,
@@ -380,7 +370,7 @@ class Trader:
 
         return mem["pepper_fallback"]
 
-    # ──────────────────────── Pepper linear logic ──────────────
+    # Original Pepper trend logic
 
     def trade_pepper_linear(
         self, state: TradingState, od: OrderDepth, pos: int
@@ -429,17 +419,16 @@ class Trader:
 
         return orders
 
-    # ──────────────────────── Pepper fallback logic ────────────
+    # Pepper fallback logic
 
     def trade_pepper_fallback(
         self, state: TradingState, od: OrderDepth, pos: int, mem: Dict
     ) -> List[Order]:
         """
-        Osmium-style fallback for Pepper.
+        Mean-reversion fallback for Pepper.
 
-        Uses a rolling mean + local-vol z-score instead of the fixed linear trend.
-        This is meant to take over once the Pepper trend becomes unreliable or once
-        the linear strategy's main hold phase has ended.
+        Uses a short rolling mean when the simple trend trade is no longer
+        trusted.
         """
         product = "INTARIAN_PEPPER_ROOT"
         limit = self.POSITION_LIMITS[product]
@@ -562,7 +551,7 @@ class Trader:
             return self.trade_pepper_fallback(state, od, pos, mem)
         return self.trade_pepper_linear(state, od, pos)
 
-    # ──────────────────────── Main run ─────────────────────────
+    # Main entry point
 
     def run(self, state: TradingState):
         print("traderData: " + state.traderData)
