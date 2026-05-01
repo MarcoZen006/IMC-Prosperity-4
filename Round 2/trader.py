@@ -5,9 +5,7 @@ OSM = "ASH_COATED_OSMIUM"
 PEP = "INTARIAN_PEPPER_ROOT"
 POS_LIMIT = {OSM: 80, PEP: 80}
 
-# Osmium: keep the validated Trader 18 shell and lean a little further into the
-# only change family that has actually improved PnL so far: better book signal
-# + lighter short-term mean reversion + slightly more aggressive taking.
+# Osmium settings.
 OSM_FAIR = 10000
 OSM_MICRO_WEIGHT = 0.34
 OSM_BASE_TAKE_EDGE = 0.50
@@ -23,10 +21,7 @@ OSM_POS_SKEW = 0.04
 OSM_RET_REV = 0.12
 OSM_JUMP_THRESHOLD = 3.0
 
-# Discrete-band Osmium inventory control:
-# normal zone     : trade normally
-# caution zone    : remove the inner same-side passive quote, keep the outer quote
-# danger zone     : remove all same-side passive quotes and make opposite-side unwind easier
+# Osmium inventory control.
 OSM_INV_WEAK_PRESSURE = 0.20
 OSM_INV_BAND_Q1 = 20
 OSM_INV_BAND_Q2 = 45
@@ -34,10 +29,7 @@ OSM_INV_CAUTION_SAME_SIDE_TAKE_PENALTY = 0.15
 OSM_INV_DANGER_SAME_SIDE_TAKE_PENALTY = 0.40
 OSM_INV_DANGER_OPPOSITE_TAKE_BONUS = 0.25
 
-# Combined hold logic from Traders 31, 33, and 36:
-# - Trader 31 baseline hold-permission behavior
-# - Trader 33 hysteresis on hold entry/exit
-# - Trader 36 inventory-size-dependent activation
+# Hold-mode settings for Osmium.
 OSM_HOLD_PRESSURE_ON = 0.18
 OSM_HOLD_PRESSURE_OFF = 0.08
 OSM_HOLD_SLOPE_ON = 0.08
@@ -48,6 +40,7 @@ OSM_HOLD_FLIP_UNWIND_BONUS = 0.20
 OSM_HOLD_FLIP_UNWIND_QUOTE_TIGHTEN = 1
 OSM_LARGE_UNWIND_QUOTE_TIGHTEN = 1
 
+# Pepper settings.
 PEP_PRIOR_DRIFT = 0.10
 PEP_HOLD_HORIZON = 80
 PEP_MAKE_EDGE_BID = 1
@@ -217,7 +210,7 @@ class Trader:
             position, pressure, micro_slope
         )
 
-        # Large inventory disables hold permission entirely.
+        # Do not hold large inventory.
         if hold_large:
             long_hold_mode = False
             short_hold_mode = False
