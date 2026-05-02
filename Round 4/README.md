@@ -1,4 +1,4 @@
-# Round 4 — Techniques Used
+# Round 4 Python Trader — Techniques Used
 
 Round 4 trades `HYDROGEL_PACK` and the same `VEV_*` voucher chain from
 round 3, with `VELVETFRUIT_EXTRACT` priced as the underlying but **not
