@@ -1,4 +1,4 @@
-# Round 5 — Techniques Used
+# Round 5 Python Trader — Techniques Used
 
 Round 5 is the final round, where the bot must trade **every product on
 the exchange** including ones it has never seen. The strategy is a
