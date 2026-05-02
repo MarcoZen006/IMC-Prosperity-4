@@ -13,5 +13,5 @@ Each round has two components:
   bidding scenarios. You have hours to analyse, model, and submit. There are no
   second chances.
 
-  You can find each of these in its respective folder as well as a summary explaining
-  the quantatative, stocastic, economic and mathematical techniques used.
+You can find each of these in its respective folder as well as a summary explaining
+the quantatative, stocastic, economic and mathematical techniques used.
