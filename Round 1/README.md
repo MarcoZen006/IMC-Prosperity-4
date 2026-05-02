@@ -1,4 +1,4 @@
-# Round 1 — Techniques Used
+# Round 1 Python Trader — Techniques Used
 
 Round 1 trades two products: `ASH_COATED_OSMIUM` (a stationary, mean-reverting
 asset) and `INTARIAN_PEPPER_ROOT` (a slowly drifting trend asset that becomes
