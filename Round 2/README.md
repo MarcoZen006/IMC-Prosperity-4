@@ -1,4 +1,4 @@
-# Round 2 — Techniques Used
+# Round 2 Python Trader — Techniques Used
 
 Round 2 trades the same two products as round 1 — `ASH_COATED_OSMIUM` and
 `INTARIAN_PEPPER_ROOT` — but with a doubled position limit (80 vs 50) and
