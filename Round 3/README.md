@@ -1,4 +1,4 @@
-# Round 3 — Techniques Used
+# Round 3 Python Trader — Techniques Used
 
 Round 3 introduces an **options chain** on top of the spot market.
 Products: `HYDROGEL_PACK`, `VELVETFRUIT_EXTRACT` (the underlying), and ten
